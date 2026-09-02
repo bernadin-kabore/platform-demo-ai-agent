@@ -1,0 +1,250 @@
+# The path and name of this file are load-bearing. The platform's
+# require-signed-images and require-sbom-attestation Kyverno policies verify
+# the keyless cosign identity
+# https://github.com/bernadin-kabore/*/.github/workflows/ci.yml@refs/heads/main
+# so an image signed from a workflow at any other path would be refused at
+# admission. Renaming this file breaks deploys, not builds.
+name: ci
+
+on:
+  pull_request:
+    branches: [main, develop, "release/**"]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  pull-requests: write
+
+env:
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Tests
+  # ---------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  coverage:
+    uses: bernadin-kabore/platform-demo-hello-world-template/.github/workflows/code-coverage.yml@main
+    with:
+      language: nodejs
+      coverage-threshold: 70
+
+  # ---------------------------------------------------------------------
+  # 2. Automated evals — the gate that makes this repository different
+  # ---------------------------------------------------------------------
+  #
+  # The offline suite replays recorded change sets (evals/cases/*.json) through
+  # the deterministic checks and asserts the verdict. It costs nothing, never
+  # flakes, and catches the regression that actually happens here: a prompt or
+  # a check edited in a way that would let a known-bad change set through.
+  #
+  # The live suite, which spends real money on Bedrock, is not run here. It
+  # gates a release rather than a commit — see docs/evals.md.
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: npm }
+      - run: npm ci
+      - name: Offline eval suite
+        run: npm run evals
+
+  # ---------------------------------------------------------------------
+  # 3. SAST
+  # ---------------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
+
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/owasp-top-ten
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------
+  # 4. SCA
+  # ---------------------------------------------------------------------
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: npm }
+      - run: npm ci
+      - run: npm audit --audit-level=high
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: sarif
+          output: trivy-fs-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs-results.sarif
+
+  # ---------------------------------------------------------------------
+  # 5. Build, scan, sign, SBOM
+  # ---------------------------------------------------------------------
+  build-scan-sign:
+    needs: [test, evals, sast, sca, coverage]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: sarif
+          output: trivy-image-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-results.sarif
+
+      - name: Push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.17.2
+        with:
+          image: "${{ env.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}"
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: cosign sign --yes "${{ env.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}"
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ env.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  # ---------------------------------------------------------------------
+  # 6. Propose the deploy
+  # ---------------------------------------------------------------------
+  #
+  # The scaffolded services push their image-tag bump straight to their own
+  # main, because the deploy bot has a bypass on their ruleset. This component
+  # deploys out of platform-demo-gitops, whose main is protected by Terraform
+  # with no bypass actor at all — so the bump arrives as a pull request that a
+  # human merges.
+  #
+  # That asymmetry is deliberate and worth keeping: an agent that can open pull
+  # requests across the platform should not also be able to deploy a new
+  # version of itself without anyone looking.
+  propose-deploy:
+    needs: build-scan-sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint platform-deploy-bot installation token
+        id: deploy-bot-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PLATFORM_DEPLOY_BOT_APP_ID }}
+          private-key: ${{ secrets.PLATFORM_DEPLOY_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: platform-demo-gitops
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/platform-demo-gitops
+          ref: main
+          token: ${{ steps.deploy-bot-token.outputs.token }}
+
+      - name: Bump the agent image in the GitOps repository
+        run: |
+          TAG="${{ needs.build-scan-sign.outputs.image_tag }}"
+          DIGEST="${{ needs.build-scan-sign.outputs.image_digest }}"
+          yq -i "(.spec.template.spec.containers[] | select(.name == \"agent\") | .image) = \"${ECR_REPOSITORY}@${DIGEST}\"" \
+            apps/ai-platform-agent/deployment.yaml
+          yq -i "(.spec.template.metadata.labels.\"app.kubernetes.io/version\") = \"${TAG}\"" \
+            apps/ai-platform-agent/deployment.yaml
+
+      - name: Open the deploy pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ steps.deploy-bot-token.outputs.token }}
+          branch: deploy-ai-platform-agent-${{ needs.build-scan-sign.outputs.image_tag }}
+          commit-message: "deploy: ai-platform-agent ${{ needs.build-scan-sign.outputs.image_tag }}"
+          title: "Deploy ai-platform-agent ${{ needs.build-scan-sign.outputs.image_tag }}"
+          body: |
+            Signed, scanned, and SBOM-attested image built from
+            ${{ github.repository }}@${{ github.sha }}.
+
+            Merging this is what deploys it — ArgoCD syncs `apps/ai-platform-agent`
+            from `main`.
+          labels: |
+            deploy
+            needs-human-approval
