@@ -4,9 +4,82 @@ The AI Platform Agent. A developer describes what they want in the portal; this
 service turns that into pull requests across the platform repositories, scores
 them, and stops if they are not good enough.
 
-It is the only new *runtime* in the AI-assisted platform. Everything that
-happens to its output afterwards — policy scanning, `terraform plan`, human
-approval, GitOps, EKS — is the platform that already existed.
+---
+
+## Start here: what this actually does
+
+Five assistants that read the platform's own code and write draft changes for a
+human to approve. They cannot deploy anything, merge anything, or touch AWS.
+
+They are not five programs. This is **one service that holds five separate
+conversations with Claude**, each given different instructions and different
+access:
+
+| | Knows about | Allowed to edit |
+|---|---|---|
+| **The router** | which specialist handles what | nothing — it only delegates |
+| **Terraform** | AWS: networks, clusters, permissions | the Terraform repo |
+| **Application** | the developer experience: templates, Helm chart, portal | the templates + portal repos |
+| **Security** | what the cluster refuses to run | the GitOps + templates repos |
+| **Observability** | metrics, logs, traces, alerts | the GitOps + templates repos |
+
+That last column is enforced in code, not by asking the model nicely. The
+Security specialist *cannot* write Terraform even if it decides it would like
+to — the tool call comes back as an error instead.
+
+### What happens when someone asks for something
+
+Say a developer types this into Backstage:
+
+> *"We never know when a service starts crash-looping."*
+
+1. **The router reads it** and works out that this is an alerting problem. It
+   wakes up the Observability specialist only. The other three never run — a
+   request that touches one part of the platform should not produce a pull
+   request touching four.
+
+2. **That specialist goes and reads the repository.** Not from memory: it opens
+   the actual files to see how this platform writes things, because a change
+   that is technically correct but idiomatically foreign still gets rejected in
+   review.
+
+3. **It writes a complete draft file** and hands it back. Nothing is saved
+   anywhere yet — a proposal is an entry in an array in memory until it clears
+   the next step.
+
+4. **The work gets checked, twice.** First by fast, dumb rules: does this YAML
+   parse, would Kubernetes refuse this pod, did it just quietly delete the image
+   scanning? Then by a second Claude that scores it — does this actually answer
+   what was asked, or does it merely look like it does?
+
+5. **If it passes, a pull request appears.** If it fails, nothing appears and
+   the portal shows the reason, which is usually the useful part.
+
+6. **A human reviews and merges it.** That is the moment it becomes real, and it
+   is the only such moment.
+
+### What they cannot do
+
+Their entire power is *"open a pull request."* That is the whole list.
+
+They cannot merge — not even in this repository. They have no kubeconfig and no
+cluster access. Their AWS permission grants exactly one action: ask Claude a
+question. Nothing else.
+
+So the worst outcome from a confused agent is a bad pull request that wastes
+someone's time, and step 4 exists mostly to prevent even that.
+
+### Why bother at all
+
+The scaffolder templates already handle *"I need a new service"* perfectly, in
+seconds, for nothing — and those requests are never routed through a model.
+
+This is for the other kind of request. The one with no template, that used to
+become a ticket, or a Slack thread, or nothing at all.
+
+---
+
+## The architecture
 
 ```
 Developer
@@ -35,22 +108,30 @@ AI Platform Agent                  ← this repository
             EKS
 ```
 
-## The one idea this is built on
+Only the top four boxes are new. This service is the only new *runtime* in the
+AI-assisted platform; everything below `Generated PRs` — policy scanning,
+`terraform plan`, human approval, GitOps, EKS — is the platform that already
+existed, untouched.
 
-**The agent's entire reach into the world is "open a pull request against a
-protected branch."**
+## Why the boundary is the design
 
-Not "apply Terraform". Not "kubectl". Not "merge". It holds no cluster
-credential, no AWS write permission beyond invoking a model, and no ruleset
-bypass anywhere. Its four specialists have exactly five tools between them, and
-only one of those changes anything — `propose_file_change`, which appends to an
-array in memory.
+The plain version above is "they can only open a pull request." Here is why
+that single constraint is load-bearing rather than a nicety.
 
-That constraint is what makes the rest of the architecture honest. Every gate
-downstream of the agent was already protecting this platform from human
-mistakes; none of them needed to be weakened to let an agent through, and none
-of them were. The AI layer adds candidate changes. It does not shorten the path
-those changes travel.
+Its four specialists have exactly five tools between them, and only one of
+those changes anything: `propose_file_change`, which appends to an array in
+memory. Repository scope is a check in the tool handler, not a line in a
+prompt, so a specialist reaching outside its scope gets an error result and has
+to route the work to whoever owns it.
+
+That is what makes the rest of the architecture honest. Every gate downstream of
+the agent was already protecting this platform from human mistakes; none of them
+needed to be weakened to let an agent through, and none of them were. The AI
+layer adds candidate changes. It does not shorten the path those changes travel.
+
+It also means the failure modes are bounded and boring. A confused agent
+produces a bad pull request. It cannot produce a bad deploy, because it has no
+route to one.
 
 ## Layout
 
