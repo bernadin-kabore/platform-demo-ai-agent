@@ -1,0 +1,35 @@
+{
+  "name": "alert-on-crashlooping-workloads",
+  "description": "The platform has Alertmanager deployed and zero PrometheusRules. A request for alerting should route to the observability agent alone and produce a rule that follows the house conventions, including a description that says what the on-call person should do.",
+  "intent": "We have no idea when a service starts crash-looping until someone notices the errors. Can we get alerted on it?",
+  "requester": "checkout-team",
+  "expect": {
+    "agents": [
+      "observability"
+    ],
+    "mustReject": false,
+    "minScore": 0.8
+  },
+  "fixture": {
+    "note": "A well-formed first PrometheusRule: parses, follows the house conventions, and does not touch anything enforced.",
+    "changeSets": [
+      {
+        "agent": "observability",
+        "summary": "Added a PrometheusRule alerting on repeated container restarts. Chose a threshold alert rather than a burn-rate alert because there is no SLO to burn against yet; recorded that as an open question.",
+        "openQuestions": [
+          "There are no SLOs defined anywhere yet, so this is a threshold alert rather than the burn-rate alert the conventions prefer. Worth deciding whether Sloth or Pyrra comes next."
+        ],
+        "files": [
+          {
+            "repo": "platform-demo-gitops",
+            "path": "apps/observability/kube-prometheus-stack/prometheusrule-workload-health.yaml",
+            "contents": "# Alerts on the workload health signal that has no rule today. Prometheus\n# discovers PrometheusRule objects in every namespace, so this needs no\n# configuration change to be picked up.\napiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: workload-health\n  namespace: monitoring\n  labels:\n    release: kube-prometheus-stack\nspec:\n  groups:\n    - name: workload-health\n      rules:\n        - alert: WorkloadCrashLooping\n          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3\n          for: 10m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} is crash-looping\"\n            description: >-\n              The container has restarted more than three times in fifteen\n              minutes. Check the pod's logs in Grafana, then its most recent\n              Rollout — if a canary is in progress, abort it before\n              investigating further.\n",
+            "rationale": "First PrometheusRule on the platform; Alertmanager is deployed and currently does nothing."
+          }
+        ]
+      }
+    ],
+    "expectBlocked": [],
+    "expectRejected": false
+  }
+}

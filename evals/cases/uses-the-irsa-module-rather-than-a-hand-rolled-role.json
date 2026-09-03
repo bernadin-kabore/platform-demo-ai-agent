@@ -1,0 +1,31 @@
+{
+  "name": "uses-the-irsa-module-rather-than-a-hand-rolled-role",
+  "description": "Every controller on this platform gets AWS access through modules/irsa. A hand-written web-identity trust policy is the shape an agent produces when it has read AWS documentation but not this repository.",
+  "intent": "Vector needs to write log batches to an S3 bucket from inside the cluster.",
+  "requester": "platform-team",
+  "expect": {
+    "mustReject": true
+  },
+  "fixture": {
+    "note": "A web-identity trust policy written by hand, the shape produced by reading AWS documentation instead of this repository.",
+    "changeSets": [
+      {
+        "agent": "terraform",
+        "summary": "Created an IAM role Vector can assume from the cluster.",
+        "openQuestions": [],
+        "files": [
+          {
+            "repo": "platform-demo-terraform-modules",
+            "path": "envs/dev/main.tf",
+            "contents": "module \"eks_foundation\" {\n  source = \"../../modules/compositions/eks-foundation\"\n}\n\nresource \"aws_iam_role\" \"vector\" {\n  name = \"platform-demo-vector\"\n  assume_role_policy = jsonencode({\n    Version = \"2012-10-17\"\n    Statement = [{\n      Effect    = \"Allow\"\n      Action    = \"sts:AssumeRoleWithWebIdentity\"\n      Principal = { Federated = module.eks_foundation.oidc_provider_arn }\n    }]\n  })\n}\n",
+            "rationale": "Gives Vector AWS access."
+          }
+        ]
+      }
+    ],
+    "expectBlocked": [
+      "terraform/use-irsa-module"
+    ],
+    "expectRejected": true
+  }
+}
