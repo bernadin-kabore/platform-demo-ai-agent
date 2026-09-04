@@ -6,27 +6,42 @@ enforced.
 ## Start here: the plain version
 
 A developer picks their service from a dropdown and describes a problem. The
-agent is then allowed to read the platform's four repositories and that one
-service's repository — nothing else — and its only possible output is a pull
-request that a person has to approve.
+agent is then allowed to read the platform's four repositories and the two
+repositories belonging to that service's application — nothing else — and it may
+change only the files that belong to that one service. Its only possible output
+is a pull request that a person has to approve.
 
 The important part is the word *picks*. The developer does not type a repository
 name and the agent does not infer one from the request text. The service comes
-from the software catalog, the catalog says who owns it, and the agent checks
-that the person asking is on that team. If any of that is uncertain, the request
-is refused rather than narrowed.
+from the software catalog, the catalog says who owns it and where it lives, and
+the agent checks that the person asking is on that team. If any of that is
+uncertain, the request is refused rather than narrowed.
+
+**Why "which repository" stopped being enough.** An application is now one
+source repository holding several services and one GitOps repository holding all
+of their deployment state. Two services in the same repository can belong to
+different on-call rotations, and the files at the top of each repository —
+the CI pipeline, the shared Helm chart, the per-environment defaults — are
+rendered by every service at once. So a scope that resolved only to a repository
+would authorize changes nobody asked for. What a request may write is therefore
+a *path*: one directory in the source repository, and one file per environment
+in the GitOps repository.
 
 So the worst thing a confused or manipulated agent can do is open a bad pull
-request against a repository the requesting team already has write access to.
-That is the entire blast radius, and it is bounded by code rather than by
-instructions in a prompt.
+request touching one service that the requesting team already owns. That is the
+entire blast radius, and it is bounded by code rather than by instructions in a
+prompt.
 
 ## The boundary, drawn once
 
 ```
 Developer picks a Component  ──►  Backstage resolves it from the catalog
-   (EntityPicker, no free text)      repository  ← github.com/project-slug
-                                     owner       ← spec.owner
+   (EntityPicker, no free text)      source repo   ← github.com/project-slug
+                                     source path   ← platform.acme.io/source-path
+                                     gitops repo   ← platform.acme.io/gitops-repo
+                                     gitops service← platform.acme.io/gitops-service
+                                     application   ← spec.system
+                                     owner         ← spec.owner
                                           │
                                           ▼
                               POST /v1/requests  { intent, requester, serviceContext }
@@ -35,12 +50,15 @@ Developer picks a Component  ──►  Backstage resolves it from the catalog
                      ┌────────────────────────────────────────┐
                      │  src/scope.ts — validateServiceContext │  ← the boundary
                      │  · shape of every field                │
-                     │  · repo is not a platform repo         │
+                     │  · neither repo is a platform repo     │
+                     │  · the two repos are not the same one  │
+                     │  · paths cannot traverse or escape     │
                      │  · requester owns the entity           │
                      │  fails closed: 403, no record created  │
                      └────────────────────────────────────────┘
                                           │
                                    RequestScope (immutable)
+                                    repos AND paths
                                           │
                     ┌─────────────────────┼─────────────────────┐
                     ▼                     ▼                     ▼
@@ -59,8 +77,9 @@ later decision reads from it.
 | Which service a request is about | The catalog, via the EntityPicker | The request text |
 | Whether the requester may act on it | `validateServiceContext`, comparing `requester` to `spec.owner` | Backstage's say-so — the agent re-checks |
 | Which repositories a specialist may read | `assertReadable`, per tool call | The system prompt |
+| Which paths a specialist may write | `assertWritablePath` → `RequestScope.isWritablePath`, per proposal | The catalog — the path convention lives in `scope.ts`, not in an annotation |
 | Which it may write | `assertWritable`, per tool call | The system prompt |
-| That nothing out of scope slipped through | `authorization/repo-scope` in the eval gate | — |
+| That nothing out of scope slipped through | `authorization/repo-scope` and `authorization/path-scope` in the eval gate | — |
 | Whether a change reaches production | Existing CI, policy, `terraform plan`, human review, ArgoCD, Kyverno | Anything in this repository |
 
 The last two rows are the ones worth dwelling on. The eval gate re-checks
@@ -75,7 +94,7 @@ platform that existed before it decides.
 **Can:**
 
 - Read the four platform repositories, always.
-- Read and propose changes to one application repository, when a developer who
+- Read and propose changes to the two repositories of one application, when a developer who
   owns it selected it.
 - Open pull requests, labelled `ai-generated` and `needs-human-approval`.
 - Refuse, and say why.
@@ -83,29 +102,35 @@ platform that existed before it decides.
 **Cannot:**
 
 - Reach any other team's service. Not by being asked, not by being persuaded,
-  not by a request that names it in prose.
+  not by a request that names it in prose. That now includes a sibling service
+  sharing the same repository: the repository grant does not carry the path.
+- Change anything shared by an application's services — its CI pipeline, its
+  Helm chart, its per-environment defaults, its ApplicationSet. Those reach
+  teams that did not ask, so they are a platform change or a human's.
 - Merge, approve, or review a pull request — including its own.
-- Bypass a branch ruleset. `platform-deploy-bot` has a bypass actor entry on
-  scaffolded repositories so CI can push image-tag bumps; this App has none,
-  anywhere, which is why human approval is a real gate here rather than a
-  formality.
+- Bypass a branch ruleset. This App has no bypass actor entry anywhere, which is
+  why human approval is a real gate here rather than a formality. Neither, now,
+  does `platform-deploy-bot`: it used to hold one on scaffolded repositories so
+  CI could push image-tag bumps to a protected branch, and under the application
+  model CI opens a pull request against the GitOps repository instead. Nothing
+  on this platform pushes past a ruleset any more.
 - Run a command against the cluster, read live data, or rotate a credential. It
   holds no kubeconfig. Its entire AWS permission is `bedrock-mantle:CreateInference`
   on two model ARNs.
-- Widen its own scope. There is no code path that adds a repository to a
-  `RequestScope` after construction.
+- Widen its own scope. There is no code path that adds a repository or a path to
+  a `RequestScope` after construction.
 
 ## The specialist split: expertise is not ownership
 
 A specialist is a domain of expertise. Being the right expert for a question
 does not by itself grant the right to write the answer anywhere.
 
-| Specialist | Writes platform | Application repo | Why |
+| Specialist | Writes platform | Source / GitOps | Why |
 |---|---|---|---|
-| `terraform` | terraform-modules | **read** | Diagnosing whether a service needs AWS infrastructure means reading its chart; if the answer is a Helm value, that is Application's change |
-| `application` | templates, backstage | **write** | Owns `chart/values.yaml`, where nearly every service-scoped fix lands |
+| `terraform` | terraform-modules | **read** / **read** | Diagnosing whether a service needs AWS infrastructure means reading its deployment state; if the answer is a Helm value, that is Application's change |
+| `application` | templates, backstage | **write** / **write** | Owns the service's values file, where nearly every service-scoped fix lands, and its code |
 | `security` | gitops, templates | **read** | Says which control a service trips and what compliance looks like; the compliant config is written by Application |
-| `observability` | gitops, templates | **write** | An alert about one service legitimately ships in that service's chart |
+| `observability` | gitops, templates | **write** / **write** | An alert about one service ships as `prometheusRules` in that service's own values; instrumentation is code |
 
 Security holding read-and-not-write on application repositories is the
 deliberate one. It means "make my app pass the policy" cannot be answered by

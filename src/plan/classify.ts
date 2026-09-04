@@ -107,15 +107,21 @@ ${AGENT_NAMES.map((name) => `  ${name}\n      ${SUB_AGENTS[name].domain}\n      
 
 How to decide ownership scope:
 
-  service        The fix belongs in one team's repository. "Increase checkout-api's
-                 memory" — one value, one service, nobody else affected.
+  service        The fix belongs to one service, in its own directory in its
+                 application's source repository or its own file in that
+                 application's deployment state. "Increase checkout-platform-auth's
+                 memory" — one value, one service, nobody else affected. Note
+                 that a change shared by every service in the application is NOT
+                 service scope, even when only one team asked for it.
   platform       The fix belongs in a platform repository and reaches everyone.
                  "Every service should alert when it crash-loops" — the rule
-                 belongs in the shared chart, not in one team's copy of it.
-  cross-cutting  It genuinely needs both, and you can say why. "checkout-api
-                 needs an alert when it OOMKills" may be a service-scoped rule
-                 plus a platform-scoped default. Do not reach for this because
-                 you are unsure; reach for it when both halves are real.
+                 belongs in the platform, not in one application's deployment
+                 state.
+  cross-cutting  It genuinely needs both, and you can say why.
+                 "checkout-platform-auth needs an alert when it OOMKills" may be
+                 a service-scoped rule plus a platform-scoped default. Do not
+                 reach for this because you are unsure; reach for it when both
+                 halves are real.
 
 Rules:
 

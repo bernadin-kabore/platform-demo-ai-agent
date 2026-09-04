@@ -68,13 +68,21 @@ export interface SubAgentDefinition {
    */
   platformRepos: readonly string[];
   /**
-   * How far this specialist reaches into the application repository resolved
-   * for the request, when there is one. Separating this from `platformRepos` is
-   * the point of the expertise/ownership split: knowing about IAM does not
-   * imply a right to edit a team's service, and being able to diagnose a
-   * problem does not require being able to fix it in place.
+   * How far this specialist reaches into the two application repositories
+   * resolved for the request, when there is a service in scope. Separating
+   * these from `platformRepos` is the point of the expertise/ownership split:
+   * knowing about IAM does not imply a right to edit a team's service, and
+   * being able to diagnose a problem does not require being able to fix it in
+   * place.
+   *
+   * The two are separate from each other because they are separate kinds of
+   * change. Raising a memory limit is deployment state; changing what the
+   * service does when it runs out of memory is code. A specialist can
+   * legitimately own one and not the other, and in this platform most of them
+   * do. Both are narrowed further by path — see RequestScope.isWritablePath.
    */
-  applicationRepoAccess: ApplicationRepoAccess;
+  sourceAccess: ApplicationRepoAccess;
+  gitopsAccess: ApplicationRepoAccess;
 }
 
 export interface PlatformRequest {

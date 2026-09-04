@@ -93,7 +93,7 @@ export function createServer(store = new RequestStore()): Express {
         requestId: request.id,
         requester: request.requester,
         entityRef: scope.service?.entityRef,
-        applicationRepo: scope.applicationRepo,
+        applicationRepos: scope.applicationRepos,
       },
       'accepted platform request',
     );

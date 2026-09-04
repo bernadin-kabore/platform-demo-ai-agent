@@ -49,7 +49,9 @@ export async function handleRequest(request: PlatformRequest, deps: Orchestrator
     span.setAttribute('request.requester', request.requester);
     if (scope.service) {
       span.setAttribute('request.service', scope.service.entityRef);
-      span.setAttribute('request.application_repo', scope.service.repo);
+      span.setAttribute('request.source_repo', scope.service.sourceRepo);
+      span.setAttribute('request.source_path', scope.service.sourcePath);
+      span.setAttribute('request.gitops_repo', scope.service.gitopsRepo);
     }
 
     try {
@@ -60,7 +62,7 @@ export async function handleRequest(request: PlatformRequest, deps: Orchestrator
       audit.record('orchestrator', 'request accepted', {
         requester: request.requester,
         entityRef: scope.service?.entityRef,
-        applicationRepo: scope.applicationRepo,
+        applicationRepos: scope.applicationRepos,
       });
 
       deps.store.update(request.id, { status: 'classifying', audit: [...audit.entries()] });
