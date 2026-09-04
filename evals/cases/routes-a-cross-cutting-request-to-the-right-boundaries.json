@@ -1,0 +1,44 @@
+{
+  "name": "routes-a-cross-cutting-request-to-the-right-boundaries",
+  "description": "A request that is genuinely two requests: something for one service now, and something the platform should arguably do for everyone. The interesting behaviour is not which files come out — it is that the split is made explicitly and each half lands on the right side of the ownership boundary, rather than the platform-wide half being quietly implemented inside one team's repository where it helps nobody else.",
+  "intent": "checkout-api needs an alert when it gets OOMKilled. Honestly every service probably wants that, but start with ours.",
+  "requester": "checkout-team",
+  "service": {
+    "entityRef": "component:default/checkout-api",
+    "name": "checkout-api",
+    "repo": "checkout-api",
+    "owner": "group:default/checkout-team"
+  },
+  "expect": {
+    "mustNotWriteRepos": [
+      "platform-demo-terraform-modules",
+      "platform-demo-backstage"
+    ]
+  },
+  "fixture": {
+    "note": "The service-scoped half done correctly: a rule that ships with the service, in the service's own chart. It is flagged for the reviewer — a template added to one service's copy of the shared chart is a divergence worth a second look — but it is a legitimate change, so it must not be blocked.",
+    "changeSets": [
+      {
+        "agent": "observability",
+        "summary": "Added an OOMKill alert to checkout-api's own chart so it ships and versions with the service. Did not add it to the shared chart: making this the default for every service is a platform decision with a blast radius across every team, and it belongs in its own pull request rather than folded into one team's request.",
+        "openQuestions": [
+          "Should this become the default for every service in common/chart? That is a platform-team call, and it would need a threshold that suits services with very different memory profiles."
+        ],
+        "denials": [],
+        "files": [
+          {
+            "repo": "checkout-api",
+            "path": "chart/templates/prometheusrule.yaml",
+            "contents": "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: checkout-api-oomkilled\n  labels:\n    team: checkout-team\nspec:\n  groups:\n    - name: checkout-api\n      rules:\n        - alert: CheckoutApiOOMKilled\n          expr: |\n            increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",container=\"checkout-api\"}[15m]) > 0\n          for: 0m\n          labels:\n            severity: warning\n          annotations:\n            summary: checkout-api was OOMKilled in the last 15 minutes\n            description: >-\n              A container exceeded its memory limit and was killed. Check the memory limit\n              in chart/values.yaml against actual peak usage before raising it further.\n",
+            "rationale": "Alert the owning team when this service is OOMKilled, with a documented response.",
+            "baseContents": null
+          }
+        ]
+      }
+    ],
+    "expectFlagged": [
+      "application/chart-divergence"
+    ],
+    "expectRejected": false
+  }
+}

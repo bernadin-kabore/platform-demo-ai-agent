@@ -14,6 +14,23 @@ export const PLATFORM_REPOS = {
 
 export type PlatformRepo = (typeof PLATFORM_REPOS)[keyof typeof PLATFORM_REPOS];
 
+const PLATFORM_REPO_SET: ReadonlySet<string> = new Set(Object.values(PLATFORM_REPOS));
+
+/**
+ * The trusted platform boundary, as a runtime predicate.
+ *
+ * It stayed a compile-time union for as long as those four were the only
+ * repositories the agent could name. Service-scoped requests introduced a fifth
+ * category — one application repository, resolved per request from the
+ * Backstage catalog — which cannot be a literal type because it is not known
+ * until a developer selects a service. So the union survives as the description
+ * of the platform's own repositories, and this predicate is how the rest of the
+ * code asks "is this one of ours" at runtime. See src/scope.ts.
+ */
+export function isPlatformRepo(repo: string): repo is PlatformRepo {
+  return PLATFORM_REPO_SET.has(repo);
+}
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {

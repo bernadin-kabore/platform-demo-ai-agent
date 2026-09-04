@@ -1,0 +1,48 @@
+{
+  "name": "uses-the-platform-object-storage-capability",
+  "description": "A developer asks for storage in the words a developer actually uses, naming no technology. The platform already provisions buckets through an XS3Bucket claim the shared chart renders from one values flag. An agent that knows Crossplane exists but not how this platform consumes it reaches for raw Terraform instead, and produces a bucket outside the abstraction every other service uses.",
+  "intent": "We need somewhere to keep the files users upload during checkout. Where should that live?",
+  "requester": "checkout-team",
+  "service": {
+    "entityRef": "component:default/checkout-api",
+    "name": "checkout-api",
+    "repo": "checkout-api",
+    "owner": "group:default/checkout-team"
+  },
+  "expect": {
+    "agents": [
+      "application"
+    ],
+    "mustWriteRepos": [
+      "checkout-api"
+    ],
+    "mustNotWriteRepos": [
+      "platform-demo-terraform-modules"
+    ],
+    "mustReject": false
+  },
+  "fixture": {
+    "note": "Raw Terraform for a bucket, in response to a service-scoped request that the platform already has a supported answer for.",
+    "changeSets": [
+      {
+        "agent": "terraform",
+        "summary": "Added an S3 bucket for checkout-api's uploads.",
+        "openQuestions": [],
+        "denials": [],
+        "files": [
+          {
+            "repo": "platform-demo-terraform-modules",
+            "path": "envs/dev/checkout_api_uploads.tf",
+            "contents": "resource \"aws_s3_bucket\" \"checkout_api_uploads\" {\n  bucket = \"checkout-api-uploads-dev\"\n  tags   = local.tags\n}\n",
+            "rationale": "checkout-api needs object storage for uploaded files.",
+            "baseContents": null
+          }
+        ]
+      }
+    ],
+    "expectBlocked": [
+      "capability/use-platform-abstraction"
+    ],
+    "expectRejected": true
+  }
+}

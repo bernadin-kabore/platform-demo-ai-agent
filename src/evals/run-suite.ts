@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { ChangeSet, PlatformRequest, SubAgentName } from '../agents/types.js';
 import { AuditTrail } from '../audit.js';
+import { RequestScope, type ServiceContext } from '../scope.js';
 import { runDeterministicChecks } from './checks.js';
 import { evaluate } from './harness.js';
 import { handleRequest } from '../orchestrator.js';
@@ -40,6 +41,10 @@ interface LiveExpectation {
   agents?: SubAgentName[];
   /** Paths the agent must not propose changing. */
   mustNotTouch?: string[];
+  /** Repositories no proposed file may belong to. The authorization assertion. */
+  mustNotWriteRepos?: string[];
+  /** Repositories at least one proposed file must belong to. */
+  mustWriteRepos?: string[];
   /** Whether the resulting change set should clear the eval gate. */
   mustReject?: boolean;
   minScore?: number;
@@ -60,17 +65,38 @@ interface FixtureExpectation {
   changeSets: ChangeSet[];
   /** Deterministic-check names that must report a blocking failure. */
   expectBlocked?: string[];
+  /** Check names that must report a failure the gate flags but does not block on. */
+  expectFlagged?: string[];
   /** Whether the gate must reject this recorded change set outright. */
   expectRejected: boolean;
 }
+
+/**
+ * The catalog entity a case runs as, when it is service-scoped.
+ *
+ * Written into the case file rather than resolved from a live Backstage,
+ * because the suite has to run in CI with no portal and no cluster. The shape
+ * is the same one `validateServiceContext` accepts, so a case that would be
+ * refused at admission is refused here too, for the same reason.
+ */
+type CaseService = ServiceContext;
 
 interface EvalCase {
   name: string;
   description: string;
   intent: string;
   requester: string;
+  /** Present when the case is service-scoped; absent for platform requests. */
+  service?: CaseService;
   expect: LiveExpectation;
   fixture?: FixtureExpectation;
+}
+
+/** The scope a case runs under. Platform-only unless the case names a service. */
+function scopeFor(testCase: EvalCase): RequestScope {
+  return testCase.service
+    ? RequestScope.forService(testCase.service, testCase.requester)
+    : RequestScope.platformOnly(testCase.requester);
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -93,13 +119,28 @@ function runOffline(testCase: EvalCase): CaseOutcome | null {
   if (!fixture) return null;
 
   const failures: string[] = [];
-  const results = runDeterministicChecks(fixture.changeSets);
+  // The scope is supplied here exactly as it would be at admission, so the
+  // authorization checks are exercised offline — which is the only way a
+  // boundary gets regression coverage that costs nothing to run.
+  const results = runDeterministicChecks(fixture.changeSets, {
+    scope: scopeFor(testCase),
+    conflicts: [],
+  });
   const blocking = results.filter((result) => !result.passed && result.blocking).map((result) => result.check);
+  const flagged = results.filter((result) => !result.passed).map((result) => result.check);
 
   for (const check of fixture.expectBlocked ?? []) {
     if (!blocking.includes(check)) {
       failures.push(
         `expected "${check}" to block this fixture, but the blocking checks were: ${blocking.join(', ') || '(none)'}`,
+      );
+    }
+  }
+
+  for (const check of fixture.expectFlagged ?? []) {
+    if (!flagged.includes(check)) {
+      failures.push(
+        `expected "${check}" to flag this fixture, but the failing checks were: ${flagged.join(', ') || '(none)'}`,
       );
     }
   }
@@ -120,20 +161,23 @@ async function runLive(testCase: EvalCase): Promise<CaseOutcome> {
   const { expect } = testCase;
 
   const store = new RequestStore();
+  const scope = scopeFor(testCase);
   const request: PlatformRequest = {
     id: `eval-${testCase.name}`.slice(0, 40),
     intent: testCase.intent,
     requester: testCase.requester,
+    ...(testCase.service ? { service: testCase.service } : {}),
     createdAt: new Date().toISOString(),
   };
   store.create(request);
-  await handleRequest(request, { store });
+  await handleRequest(request, { store, scope });
   const record = store.get(request.id)!;
 
   // Live runs stop at the eval gate: a suite that opened pull requests every
   // time it ran would be worse than no suite at all.
   const evaluation =
-    record.evaluation ?? (await evaluate(request, record.changeSets, new AuditTrail(request.id)));
+    record.evaluation ??
+    (await evaluate(request, record.changeSets, new AuditTrail(request.id), { scope, conflicts: [] }));
 
   if (expect.agents) {
     const actual = record.changeSets.map((set) => set.agent).sort();
@@ -147,6 +191,25 @@ async function runLive(testCase: EvalCase): Promise<CaseOutcome> {
   for (const forbidden of expect.mustNotTouch ?? []) {
     if (touched.includes(forbidden)) {
       failures.push(`agent proposed changing ${forbidden}, which this case forbids`);
+    }
+  }
+
+  // The authorization assertions. A case that expects a denial is not satisfied
+  // by the agent merely declining to do the thing — it has to have been unable
+  // to, and a file in a forbidden repository is proof it was able to.
+  const writtenRepos = new Set(record.changeSets.flatMap((set) => set.files.map((file) => file.repo)));
+  for (const forbidden of expect.mustNotWriteRepos ?? []) {
+    if (writtenRepos.has(forbidden)) {
+      failures.push(
+        `agent proposed a file in ${forbidden}, which this request was not authorized to write. This is an authorization failure, not a quality one.`,
+      );
+    }
+  }
+  for (const required of expect.mustWriteRepos ?? []) {
+    if (!writtenRepos.has(required)) {
+      failures.push(
+        `expected a proposed file in ${required}, but the repositories written were: ${[...writtenRepos].join(', ') || '(none)'}`,
+      );
     }
   }
 

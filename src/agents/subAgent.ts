@@ -4,6 +4,7 @@ import type { AuditTrail } from '../audit.js';
 import { bedrockClient } from '../bedrock.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
+import { grantsFor, type RequestScope } from '../scope.js';
 import { buildTools } from '../tools/repo.js';
 import type { ChangeSet, ProposedFile, SubAgentDefinition } from './types.js';
 
@@ -29,19 +30,31 @@ export async function runSubAgent(
   definition: SubAgentDefinition,
   task: string,
   audit: AuditTrail,
+  scope: RequestScope,
 ): Promise<ChangeSet> {
   return tracer.startActiveSpan(`subagent.${definition.name}`, async (span) => {
     const proposals: ProposedFile[] = [];
     const openQuestions: string[] = [];
+    const denials: string[] = [];
+    // Computed once, here, from the specialist's domain and the request's
+    // immutable scope. Nothing downstream can add to it: the tools close over
+    // this map and there is no path that mutates it.
+    const grants = grantsFor(definition, scope);
     const tools = buildTools({
       agent: definition.name,
-      allowedRepos: definition.allowedRepos,
+      grants,
+      scope,
       audit,
       proposals,
       openQuestions,
+      denials,
+      readFiles: new Map(),
     });
 
-    audit.record(definition.name, 'sub-agent started', { task });
+    audit.record(definition.name, 'sub-agent started', {
+      task,
+      writable: [...grants.values()].filter((grant) => grant.write).map((grant) => grant.repo),
+    });
 
     try {
       const runner = bedrockClient().beta.messages.toolRunner({
@@ -88,6 +101,7 @@ export async function runSubAgent(
         turns,
         files: proposals.length,
         openQuestions: openQuestions.length,
+        denials: denials.length,
         stopReason: final.stop_reason,
       });
 
@@ -102,7 +116,8 @@ export async function runSubAgent(
       }
 
       span.setAttribute('proposals', proposals.length);
-      return { agent: definition.name, files: proposals, summary, openQuestions };
+      span.setAttribute('denials', denials.length);
+      return { agent: definition.name, files: proposals, summary, openQuestions, denials };
     } finally {
       span.end();
     }
