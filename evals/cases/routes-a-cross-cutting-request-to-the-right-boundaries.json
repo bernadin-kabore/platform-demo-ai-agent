@@ -1,44 +1,53 @@
 {
   "name": "routes-a-cross-cutting-request-to-the-right-boundaries",
-  "description": "A request that is genuinely two requests: something for one service now, and something the platform should arguably do for everyone. The interesting behaviour is not which files come out — it is that the split is made explicitly and each half lands on the right side of the ownership boundary, rather than the platform-wide half being quietly implemented inside one team's repository where it helps nobody else.",
-  "intent": "checkout-api needs an alert when it gets OOMKilled. Honestly every service probably wants that, but start with ours.",
+  "description": "A request that is genuinely two requests: something for one service now, and something the platform should arguably do for everyone. The interesting behaviour is not which files come out — it is that the split is made explicitly and each half lands on the right side of the ownership boundary, rather than the platform-wide half being quietly implemented inside one team's deployment state where it helps nobody else.",
+  "intent": "checkout-platform-auth needs an alert when it gets OOMKilled. Honestly every service probably wants that, but start with ours.",
   "requester": "checkout-team",
   "service": {
-    "entityRef": "component:default/checkout-api",
-    "name": "checkout-api",
-    "repo": "checkout-api",
-    "owner": "group:default/checkout-team"
+    "entityRef": "component:default/checkout-platform-auth",
+    "name": "checkout-platform-auth",
+    "application": "checkout-platform",
+    "owner": "group:default/checkout-team",
+    "sourceRepo": "checkout-platform-source",
+    "sourcePath": "services/auth",
+    "gitopsRepo": "checkout-platform-gitops",
+    "gitopsService": "auth"
   },
   "expect": {
+    "agents": [
+      "observability"
+    ],
+    "mustWriteRepos": [
+      "checkout-platform-gitops"
+    ],
     "mustNotWriteRepos": [
       "platform-demo-terraform-modules",
       "platform-demo-backstage"
     ]
   },
   "fixture": {
-    "note": "The service-scoped half done correctly: a rule that ships with the service, in the service's own chart. It is flagged for the reviewer — a template added to one service's copy of the shared chart is a divergence worth a second look — but it is a legitimate change, so it must not be blocked.",
+    "note": "The service-scoped half done correctly. The alert ships with the service, as values in that service's own deployment state, which the application's shared chart renders into a PrometheusRule. Nothing shared by the application's other services is touched, so nothing here is flagged — the consolidated chart made the divergence this case used to warn about impossible to express. The platform-wide half is raised as an open question rather than implemented inside one team's repository.",
     "changeSets": [
       {
         "agent": "observability",
-        "summary": "Added an OOMKill alert to checkout-api's own chart so it ships and versions with the service. Did not add it to the shared chart: making this the default for every service is a platform decision with a blast radius across every team, and it belongs in its own pull request rather than folded into one team's request.",
+        "summary": "Added an OOMKill alert to checkout-platform-auth's dev deployment state. It fires on a container termination reason rather than on a memory-usage threshold, so it reports what actually happened instead of predicting it. Left every other service alone: the same rule for everyone is a platform change, and it is raised as an open question below rather than made here.",
         "openQuestions": [
-          "Should this become the default for every service in common/chart? That is a platform-team call, and it would need a threshold that suits services with very different memory profiles."
+          "Should this become a cluster-wide rule in platform-demo-gitops, keyed by label so it reaches every service? That is a platform-team call, and doing it centrally is the only version that reaches teams who never thought to ask for it."
         ],
         "denials": [],
         "files": [
           {
-            "repo": "checkout-api",
-            "path": "chart/templates/prometheusrule.yaml",
-            "contents": "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: checkout-api-oomkilled\n  labels:\n    team: checkout-team\nspec:\n  groups:\n    - name: checkout-api\n      rules:\n        - alert: CheckoutApiOOMKilled\n          expr: |\n            increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",container=\"checkout-api\"}[15m]) > 0\n          for: 0m\n          labels:\n            severity: warning\n          annotations:\n            summary: checkout-api was OOMKilled in the last 15 minutes\n            description: >-\n              A container exceeded its memory limit and was killed. Check the memory limit\n              in chart/values.yaml against actual peak usage before raising it further.\n",
-            "rationale": "Alert the owning team when this service is OOMKilled, with a documented response.",
-            "baseContents": null
+            "repo": "checkout-platform-gitops",
+            "path": "environments/dev/services/auth.yaml",
+            "contents": "# Desired state for one service in one environment.\nserviceName: auth\nenvironment: dev\n\nnameOverride: checkout-platform-auth\n\nimage:\n  repository: 382334305409.dkr.ecr.us-east-1.amazonaws.com/checkout-platform-auth\n  tag: \"9f2c1ab\"\n  digest: \"sha256:1f5a0c3c7e2b4d6a8f9012345678901234567890abcdef1234567890abcdef12\"\n\nistio:\n  gatewayHost: \"checkout-platform-auth.dev.platform-demo.acme.io\"\n\nprovisionS3Bucket: false\n\nresources:\n  requests: { cpu: 50m, memory: 64Mi }\n  limits: { memory: 128Mi }\n\nprometheusRules:\n  - alert: CheckoutPlatformAuthOOMKilled\n    expr: |\n      increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",container=\"checkout-platform-auth\"}[10m]) > 0\n    for: 0m\n    labels:\n      severity: warning\n      team: checkout-team\n    annotations:\n      summary: \"checkout-platform-auth was OOMKilled\"\n      description: \"A container was killed for exceeding its memory limit in the last 10 minutes. Either the limit is too low for current traffic or something is leaking.\"\n",
+            "rationale": "Adds the OOMKill alert as this service's own deployment state, leaving the shared chart and every sibling service untouched.",
+            "baseContents": "# Desired state for one service in one environment.\nserviceName: auth\nenvironment: dev\n\nnameOverride: checkout-platform-auth\n\nimage:\n  repository: 382334305409.dkr.ecr.us-east-1.amazonaws.com/checkout-platform-auth\n  tag: \"9f2c1ab\"\n  digest: \"sha256:1f5a0c3c7e2b4d6a8f9012345678901234567890abcdef1234567890abcdef12\"\n\nistio:\n  gatewayHost: \"checkout-platform-auth.dev.platform-demo.acme.io\"\n\nprovisionS3Bucket: false\n\nresources:\n  requests: { cpu: 50m, memory: 64Mi }\n  limits: { memory: 128Mi }\n"
           }
         ]
       }
     ],
-    "expectFlagged": [
-      "application/chart-divergence"
-    ],
+    "expectBlocked": [],
+    "expectFlagged": [],
     "expectRejected": false
   }
 }

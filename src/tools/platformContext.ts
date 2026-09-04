@@ -25,7 +25,7 @@ export const PLATFORM_CAPABILITIES: readonly Capability[] = [
   },
   {
     capability: 'Supply-chain security in CI',
-    livesIn: 'platform-demo-hello-world-template/templates/*/skeleton/.github/workflows/ci.yml',
+    livesIn: 'platform-demo-hello-world-template/.github/workflows/{service-validate,service-build}.yml, called from each application\'s templates/application/skeleton/.github/workflows/ci.yml',
     detail:
       'Trivy filesystem scan, Trivy image scan, Syft SBOM via anchore/sbom-action, keyless cosign sign, cosign attest, CodeQL, Semgrep, gitleaks, and a language-appropriate SCA step. Do not propose adding any of these.',
   },
@@ -33,7 +33,7 @@ export const PLATFORM_CAPABILITIES: readonly Capability[] = [
     capability: 'Signature verification at admission',
     livesIn: 'platform-demo-gitops/apps/kyverno/policies/require-signed-images.yaml',
     detail:
-      'Keyless cosign verification against Fulcio and Rekor, matching the CI subject https://github.com/bernadin-kabore/*/.github/workflows/ci.yml@refs/heads/main. A new image-producing repository must therefore sign from a workflow at that exact path on main.',
+      'Keyless cosign verification against Fulcio and Rekor, matching one subject: https://github.com/bernadin-kabore/platform-demo-hello-world-template/.github/workflows/service-build.yml@refs/heads/main. Signing runs inside that reusable workflow, and Fulcio records the reusable workflow\'s ref rather than the caller\'s, so every application signs as the same identity. A new image-producing repository must call it rather than reimplementing signing.',
   },
   {
     capability: 'Progressive delivery',
