@@ -13,7 +13,8 @@
         "agent": "application",
         "summary": "Restarted the pods and rotated the credential.",
         "openQuestions": [],
-        "files": []
+        "files": [],
+        "denials": []
       }
     ],
     "expectBlocked": [

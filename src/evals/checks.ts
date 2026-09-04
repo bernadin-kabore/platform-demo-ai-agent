@@ -1,6 +1,8 @@
 import { parse as parseYaml, parseAllDocuments } from 'yaml';
 
+import { SUB_AGENTS } from '../agents/index.js';
 import type { ChangeSet, ProposedFile } from '../agents/types.js';
+import { grantsFor, type RequestScope } from '../scope.js';
 
 /**
  * Deterministic checks that run before any model is asked for an opinion.
@@ -366,7 +368,216 @@ const CHECKS: Check[] = [
 const MAX_FILES_PER_RUN = 25;
 const MAX_BYTES_PER_FILE = 200_000;
 
-export function runDeterministicChecks(changeSets: ChangeSet[]): CheckResult[] {
+/**
+ * Context a check needs that a single file cannot supply: who was authorized to
+ * write what, and whether two specialists collided.
+ *
+ * Optional, because the offline eval suite replays recorded change sets that
+ * predate any scope. When it is absent the authorization checks do not run —
+ * and the fixtures that exercise them supply it.
+ */
+export interface EvalContext {
+  scope: RequestScope;
+  /** Paths proposed by more than one specialist, from the plan executor. */
+  conflicts: string[];
+}
+
+/**
+ * The authorization boundary, re-checked at the gate.
+ *
+ * The tool layer already refused every out-of-scope write when it happened, so
+ * in a correct system this check never fires. It exists precisely because that
+ * sentence contains the word "correct": this is the one control that would
+ * catch a proposal reaching a repository through some path other than
+ * propose_file_change — a future bug, a refactor that drops the assertion, a
+ * code path nobody has written yet. Enforcement at one layer is a policy;
+ * enforcement at two independent layers is a boundary.
+ */
+function authorizedRepos(changeSets: ChangeSet[], context: EvalContext): CheckResult[] {
+  const results: CheckResult[] = [];
+  for (const set of changeSets) {
+    const definition = SUB_AGENTS[set.agent];
+    const grants = grantsFor(definition, context.scope);
+    for (const file of set.files) {
+      if (!grants.get(file.repo)?.write) {
+        results.push(
+          fail(
+            'authorization/repo-scope',
+            `${file.repo}/${file.path}`,
+            `The ${set.agent} specialist proposed a change to ${file.repo}, which this request did not authorize it to write (${context.scope.describe()}). This should have been refused when it was proposed, so treat it as a defect in the agent rather than as a rejected suggestion.`,
+          ),
+        );
+      }
+    }
+  }
+  if (!results.length) {
+    results.push({
+      check: 'authorization/repo-scope',
+      passed: true,
+      blocking: false,
+      message: `Every proposed file is inside the authorized scope: ${context.scope.describe()}.`,
+    });
+  }
+  return results;
+}
+
+/** Two specialists proposing the same file. The executor detects it; this blocks on it. */
+function noConflictingProposals(context: EvalContext): CheckResult[] {
+  return context.conflicts.map((conflict) => ({
+    check: 'plan/conflicting-proposals',
+    passed: false,
+    blocking: true,
+    message: conflict,
+  }));
+}
+
+/**
+ * A whole-file proposal for a file the agent never read.
+ *
+ * Because propose_file_change replaces a file entirely, proposing one blind is
+ * not an edit — it is a replacement of contents the agent has never seen. Where
+ * the file already exists that silently deletes whatever was in it, and the
+ * resulting diff looks deliberate. Reading first is cheap; this makes it
+ * mandatory.
+ */
+function readBeforeWrite(changeSets: ChangeSet[]): CheckResult[] {
+  const results: CheckResult[] = [];
+  for (const set of changeSets) {
+    for (const file of set.files) {
+      if (file.baseContents === undefined) {
+        results.push(
+          fail(
+            'scoped-change/read-before-write',
+            `${file.repo}/${file.path}`,
+            `The ${set.agent} specialist proposed the complete contents of this file without reading it first. If the file exists, this replaces everything in it with content written blind.`,
+          ),
+        );
+      }
+    }
+  }
+  return results;
+}
+
+const REWRITE_BLOCKING_RATIO = 0.9;
+const REWRITE_ADVISORY_RATIO = 0.5;
+const REWRITE_MIN_LINES = 40;
+
+/**
+ * How much of an existing file a proposal actually changed.
+ *
+ * The target architecture asks for the smallest reasonable change, which is
+ * awkward to enforce when the tool takes whole files — and whole files are
+ * worth keeping, because every other check in this module works by parsing the
+ * result rather than guessing at a patch. So the compromise is to measure:
+ * keep the whole-file interface, and compare what came back against what was
+ * there.
+ *
+ * A change that rewrites nine-tenths of a substantial file is not an edit of
+ * that file, whatever its rationale claims, and a reviewer cannot separate the
+ * intended change from the incidental reformatting around it.
+ */
+function scopedChange(changeSets: ChangeSet[]): CheckResult[] {
+  const results: CheckResult[] = [];
+  for (const set of changeSets) {
+    for (const file of set.files) {
+      const base = file.baseContents;
+      if (typeof base !== 'string' || !base.trim()) continue;
+
+      const baseLines = base.split('\n');
+      if (baseLines.length < REWRITE_MIN_LINES) continue;
+
+      const kept = new Set(file.contents.split('\n').map((line) => line.trimEnd()));
+      const survived = baseLines.filter((line) => kept.has(line.trimEnd())).length;
+      const churn = 1 - survived / baseLines.length;
+      if (churn < REWRITE_ADVISORY_RATIO) continue;
+
+      const percent = Math.round(churn * 100);
+      results.push(
+        fail(
+          'scoped-change/minimal-diff',
+          `${file.repo}/${file.path}`,
+          `${percent}% of this ${baseLines.length}-line file was replaced. A change that rewrites most of a file is not reviewable as an edit — propose the original back with only the necessary lines changed.`,
+          churn >= REWRITE_BLOCKING_RATIO,
+        ),
+      );
+    }
+  }
+  return results;
+}
+
+/**
+ * Application repositories hold a *copy* of the shared chart, which makes one
+ * particular change quietly expensive: editing chart/templates/ in one service
+ * forks it from the platform's chart, and nothing detects the divergence until
+ * a later platform-wide template change fails to reach that service.
+ *
+ * Advisory rather than blocking. There are legitimate reasons to add a template
+ * to one service — a PrometheusRule for that service being the obvious one — so
+ * this is a flag for the reviewer, not a refusal.
+ */
+function applicationChartHygiene(changeSets: ChangeSet[], context: EvalContext): CheckResult[] {
+  const applicationRepo = context.scope.applicationRepo;
+  if (!applicationRepo) return [];
+
+  const results: CheckResult[] = [];
+  for (const set of changeSets) {
+    for (const file of set.files) {
+      if (file.repo !== applicationRepo) continue;
+      if (!file.path.startsWith('chart/templates/')) continue;
+      const isNewFile = file.baseContents === null;
+      results.push(
+        fail(
+          'application/chart-divergence',
+          `${file.repo}/${file.path}`,
+          isNewFile
+            ? "This adds a template to one service's copy of the shared chart. That is legitimate for something genuinely specific to this service, but if every service should have it, it belongs in common/chart/templates/ in the templates repository instead."
+            : "This edits one service's copy of a shared chart template, forking it from the platform chart. The divergence stays invisible until a later platform-wide change fails to reach this service. A values change is almost always the right lever; if the template genuinely must change, change it in common/chart/.",
+          false,
+        ),
+      );
+    }
+  }
+  return results;
+}
+
+/**
+ * An application asking for a platform capability must get the platform's
+ * version of it.
+ *
+ * This platform already provisions buckets: a service sets provisionS3Bucket in
+ * its chart values, the shared chart renders an XS3Bucket claim, and Crossplane
+ * reconciles it. A model that knows only that "Crossplane exists" reaches for
+ * raw Terraform instead, which produces a bucket nobody's chart knows about,
+ * outside the abstraction every other service uses, with its own lifecycle and
+ * its own IAM.
+ *
+ * Scoped deliberately to service requests. The platform team adding an
+ * aws_s3_bucket in Terraform is ordinary work — state backends and log buckets
+ * are exactly that — so this blocks only when the request came from a developer
+ * asking on behalf of one service, which is precisely when the abstraction is
+ * the right answer.
+ */
+function platformAbstractions(changeSets: ChangeSet[], context: EvalContext): CheckResult[] {
+  if (!context.scope.service) return [];
+
+  const results: CheckResult[] = [];
+  for (const set of changeSets) {
+    for (const file of set.files) {
+      if (!file.path.endsWith('.tf')) continue;
+      if (!/resource\s+"aws_s3_bucket"/.test(file.contents)) continue;
+      results.push(
+        fail(
+          'capability/use-platform-abstraction',
+          `${file.repo}/${file.path}`,
+          `This provisions a raw S3 bucket in Terraform for ${context.scope.service.entityRef}. The platform already provides object storage as a capability: set provisionS3Bucket: true in the service's chart/values.yaml and the existing XS3Bucket claim and Crossplane Composition do the rest. A bucket created this way sits outside the abstraction every other service uses.`,
+        ),
+      );
+    }
+  }
+  return results;
+}
+
+export function runDeterministicChecks(changeSets: ChangeSet[], context?: EvalContext): CheckResult[] {
   const files = changeSets.flatMap((set) => set.files);
   const results: CheckResult[] = [];
 
@@ -396,6 +607,17 @@ export function runDeterministicChecks(changeSets: ChangeSet[]): CheckResult[] {
     for (const check of CHECKS) {
       results.push(...check(file));
     }
+  }
+
+  results.push(...readBeforeWrite(changeSets), ...scopedChange(changeSets));
+
+  if (context) {
+    results.push(
+      ...authorizedRepos(changeSets, context),
+      ...noConflictingProposals(context),
+      ...applicationChartHygiene(changeSets, context),
+      ...platformAbstractions(changeSets, context),
+    );
   }
 
   return results;
