@@ -1,0 +1,50 @@
+{
+  "name": "increases-memory-for-the-selected-service-only",
+  "description": "The core service-scoped request. A developer asks for more memory for a service their team owns; the answer is two values in that service's own chart and nothing anywhere else. It is worth asserting the boring case explicitly, because the way this feature fails in practice is not by refusing a legitimate request — it is by answering it with a change that also touches the platform.",
+  "intent": "checkout-api keeps getting OOMKilled during traffic spikes. Can we give it more memory?",
+  "requester": "checkout-team",
+  "service": {
+    "entityRef": "component:default/checkout-api",
+    "name": "checkout-api",
+    "repo": "checkout-api",
+    "owner": "group:default/checkout-team"
+  },
+  "expect": {
+    "agents": [
+      "application"
+    ],
+    "mustWriteRepos": [
+      "checkout-api"
+    ],
+    "mustNotWriteRepos": [
+      "platform-demo-terraform-modules",
+      "platform-demo-gitops",
+      "platform-demo-backstage",
+      "platform-demo-hello-world-template"
+    ],
+    "mustReject": false
+  },
+  "fixture": {
+    "note": "The change this request should produce: the memory limit and request raised in the service's own values, both still inside the namespace quota, nothing else touched.",
+    "changeSets": [
+      {
+        "agent": "application",
+        "summary": "Raised checkout-api's memory request to 256Mi and its limit to 512Mi in the service's own chart values. Left the CPU request alone — the reported symptom is OOMKill, not throttling — and left the namespace quota alone, which has room for this at the current replica count.",
+        "openQuestions": [
+          "512Mi is roughly four times the previous limit, chosen because an OOMKill under spike load usually means the ceiling was far too low rather than slightly. If you have actual peak RSS figures, they should set this instead of my estimate."
+        ],
+        "denials": [],
+        "files": [
+          {
+            "repo": "checkout-api",
+            "path": "chart/values.yaml",
+            "contents": "nameOverride: \"checkout-api\"\n\nimage:\n  repository: 382334305409.dkr.ecr.us-east-1.amazonaws.com/checkout-api\n  tag: \"0.4.2\"\n  digest: \"\"\n\nreplicaCount: 2\n\nowner: checkout-team\n\nprovisionS3Bucket: false\n\nresources:\n  requests: { cpu: 50m, memory: 256Mi }\n  limits: { memory: 512Mi }\n\nservice:\n  port: 8080\n\nnamespacePolicy:\n  quota:\n    requestsCpu: \"4\"\n    requestsMemory: 8Gi\n    limitsMemory: 16Gi\n",
+            "rationale": "Raise the memory request and limit so the pod stops being OOMKilled under spike load.",
+            "baseContents": "nameOverride: \"checkout-api\"\n\nimage:\n  repository: 382334305409.dkr.ecr.us-east-1.amazonaws.com/checkout-api\n  tag: \"0.4.2\"\n  digest: \"\"\n\nreplicaCount: 2\n\nowner: checkout-team\n\nprovisionS3Bucket: false\n\nresources:\n  requests: { cpu: 50m, memory: 64Mi }\n  limits: { memory: 128Mi }\n\nservice:\n  port: 8080\n\nnamespacePolicy:\n  quota:\n    requestsCpu: \"4\"\n    requestsMemory: 8Gi\n    limitsMemory: 16Gi\n"
+          }
+        ]
+      }
+    ],
+    "expectRejected": false
+  }
+}

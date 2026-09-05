@@ -54,6 +54,54 @@ And one is a policy statement rather than a bug catcher:
   right; it is never right to do it folded into a change set whose stated purpose
   was something else.
 
+### Checks that arrived with service-scoped requests
+
+Letting a developer's own repository into scope added a class of failure the
+original checks had no way to express, because until then every writable
+repository was a compile-time constant.
+
+- `authorization/repo-scope` — every proposed file is re-checked against the
+  request's scope, recomputed here from the specialist and the `RequestScope`
+  rather than taken on trust from the tool layer. In a correct system this never
+  fires: `assertWritable` already refused the write when it happened. It exists
+  because "in a correct system" is an assumption, and this is the check that
+  would catch a proposal reaching a repository through some path nobody has
+  written yet. Enforcement at one layer is a policy; at two independent layers
+  it is a boundary.
+
+- `plan/conflicting-proposals` — two specialists proposing the same file. Each
+  supplies a *complete* file, and `openPullRequests` commits them in sequence,
+  so without this the second silently overwrites the first: no error, a
+  plausible diff, and one specialist's work gone. The executor detects the
+  collision; the gate refuses to ship it. It is not resolved automatically,
+  because picking a winner would be a guess about which specialist was right.
+
+- `scoped-change/read-before-write` — a whole-file proposal for a file the agent
+  never read. Proposing blind is not an edit; where the file exists it replaces
+  contents the agent has never seen, and the resulting diff looks deliberate.
+
+- `scoped-change/minimal-diff` — how much of an existing file the proposal
+  actually changed, measured against the contents the agent read. This is the
+  compromise that lets whole-file proposals survive the requirement for scoped
+  changes: keep the interface every other check depends on, and measure the
+  result. Advisory above half the file, blocking above nine-tenths of a file of
+  forty lines or more.
+
+- `capability/use-platform-abstraction` — raw `aws_s3_bucket` Terraform in
+  response to a *service-scoped* request. The platform already provisions
+  buckets: a service sets `provisionS3Bucket` and the existing XS3Bucket claim
+  does the rest. Scoped to service requests deliberately — the platform team
+  adding a state or log bucket in Terraform is ordinary work.
+
+- `application/chart-divergence` — advisory. A service holds a copy of the
+  shared chart, so editing `chart/templates/` there forks it from the platform's
+  version and nothing notices until a later platform-wide change fails to reach
+  that service. Advisory rather than blocking because some services legitimately
+  need a template of their own.
+
+The first two are the ones that matter. The rest improve reviewability; those
+two are the difference between a boundary and a suggestion.
+
 ### 2. A review model — can only lower a verdict
 
 `src/evals/judge.ts`. Five rubric dimensions, weighted:
@@ -133,3 +181,6 @@ them into one field makes the suite assert nothing useful.
 - Its threshold is not evidence-based yet. `EVAL_MIN_SCORE` defaults to 0.8 with
   no score distribution behind it. The honest way to set it is to run the live
   suite enough times to see the distribution first.
+- It checks what was **written**, not what was **read**. `authorization/repo-scope`
+  validates the repositories a change set touched; an unauthorized read is
+  refused and recorded by the tool layer alone, with no second opinion here.

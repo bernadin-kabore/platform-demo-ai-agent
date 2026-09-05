@@ -24,9 +24,11 @@
             "repo": "platform-demo-gitops",
             "path": "apps/observability/kube-prometheus-stack/prometheusrule-workload-health.yaml",
             "contents": "# Alerts on the workload health signal that has no rule today. Prometheus\n# discovers PrometheusRule objects in every namespace, so this needs no\n# configuration change to be picked up.\napiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: workload-health\n  namespace: monitoring\n  labels:\n    release: kube-prometheus-stack\nspec:\n  groups:\n    - name: workload-health\n      rules:\n        - alert: WorkloadCrashLooping\n          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3\n          for: 10m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} is crash-looping\"\n            description: >-\n              The container has restarted more than three times in fifteen\n              minutes. Check the pod's logs in Grafana, then its most recent\n              Rollout — if a canary is in progress, abort it before\n              investigating further.\n",
-            "rationale": "First PrometheusRule on the platform; Alertmanager is deployed and currently does nothing."
+            "rationale": "First PrometheusRule on the platform; Alertmanager is deployed and currently does nothing.",
+            "baseContents": null
           }
-        ]
+        ],
+        "denials": []
       }
     ],
     "expectBlocked": [],

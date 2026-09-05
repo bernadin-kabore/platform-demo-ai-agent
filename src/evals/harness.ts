@@ -3,7 +3,7 @@ import { trace } from '@opentelemetry/api';
 import type { AuditTrail } from '../audit.js';
 import type { ChangeSet, PlatformRequest } from '../agents/types.js';
 import { config } from '../config.js';
-import { type CheckResult, runDeterministicChecks } from './checks.js';
+import { type CheckResult, type EvalContext, runDeterministicChecks } from './checks.js';
 import { type JudgeResult, judgeChangeSet } from './judge.js';
 
 const tracer = trace.getTracer('ai-platform-agent');
@@ -83,10 +83,11 @@ export async function evaluate(
   request: PlatformRequest,
   changeSets: ChangeSet[],
   audit: AuditTrail,
+  context: EvalContext,
 ): Promise<EvalReport> {
   return tracer.startActiveSpan('evals', async (span) => {
     try {
-      const checks = runDeterministicChecks(changeSets);
+      const checks = runDeterministicChecks(changeSets, context);
       const blocking = checks.filter((check) => !check.passed && check.blocking);
       audit.record('evals', 'ran deterministic checks', {
         total: checks.length,

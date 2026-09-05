@@ -5,6 +5,7 @@ import express, { type Express } from 'express';
 import type { PlatformRequest } from './agents/types.js';
 import { logger } from './logger.js';
 import { handleRequest } from './orchestrator.js';
+import { RequestScope, ScopeDenied, validateServiceContext } from './scope.js';
 import { RequestStore } from './store.js';
 
 /**
@@ -33,11 +34,20 @@ export function createServer(store = new RequestStore()): Express {
     res.json({ status: 'ready' });
   });
 
+  // Where the authorization boundary is drawn, and the only place it is drawn.
+  //
+  // The scope is resolved here, before the request is stored and long before a
+  // model sees the text, and it is immutable afterwards. Everything downstream
+  // — the classifier, the specialists, the tools — reads from it and none of
+  // them can add to it. A request that cannot be scoped is refused with 403
+  // rather than accepted and narrowed later, because "accepted, then narrowed"
+  // is the shape in which authorization bugs hide.
   app.post('/v1/requests', (req, res) => {
-    const { intent, requester, service } = req.body ?? {};
+    const { intent, requester, serviceContext } = req.body ?? {};
     if (typeof intent !== 'string' || intent.trim().length < 10) {
       res.status(400).json({
-        error: 'intent is required and must be at least 10 characters — describe what you want in a sentence or two.',
+        error:
+          'intent is required and must be at least 10 characters — describe what you want in a sentence or two.',
       });
       return;
     }
@@ -46,20 +56,51 @@ export function createServer(store = new RequestStore()): Express {
       return;
     }
 
+    // serviceContext is present exactly when the developer selected a service
+    // in the portal. Backstage resolves the Component and its owner from the
+    // catalog; this re-validates every field of that resolution, including the
+    // ownership comparison, so a compromised portal cannot mint access to a
+    // repository the requesting team does not own.
+    let scope: RequestScope;
+    try {
+      scope =
+        serviceContext === undefined || serviceContext === null
+          ? RequestScope.platformOnly(requester.trim())
+          : RequestScope.forService(validateServiceContext(serviceContext, requester.trim()), requester.trim());
+    } catch (error) {
+      if (error instanceof ScopeDenied) {
+        logger.warn(
+          { requester, reason: error.reason, detail: error.detail },
+          'refused a platform request at the authorization boundary',
+        );
+        res.status(403).json({ error: error.reason, detail: error.detail });
+        return;
+      }
+      throw error;
+    }
+
     const request: PlatformRequest = {
       id: randomUUID().slice(0, 8),
       intent: intent.trim(),
       requester: requester.trim(),
-      ...(typeof service === 'string' && service.trim() ? { service: service.trim() } : {}),
+      ...(scope.service ? { service: scope.service } : {}),
       createdAt: new Date().toISOString(),
     };
 
     store.create(request);
-    logger.info({ requestId: request.id, requester: request.requester }, 'accepted platform request');
+    logger.info(
+      {
+        requestId: request.id,
+        requester: request.requester,
+        entityRef: scope.service?.entityRef,
+        applicationRepo: scope.applicationRepo,
+      },
+      'accepted platform request',
+    );
 
     // Fire and forget: handleRequest records its own failures into the store,
     // so an unhandled rejection here would be a bug rather than a normal path.
-    void handleRequest(request, { store }).catch((error) => {
+    void handleRequest(request, { store, scope }).catch((error) => {
       logger.error({ err: error, requestId: request.id }, 'orchestrator threw outside its own handler');
     });
 
@@ -85,6 +126,10 @@ export function createServer(store = new RequestStore()): Express {
 function serialize(record: ReturnType<RequestStore['get']> & {}) {
   return {
     ...record,
+    // The plan is the portal's headline: it is what the developer reads to see
+    // whether the platform understood them, and it exists even when the run
+    // produced nothing.
+    plan: record.plan,
     // The eval report is a class; the portal wants its rendered form and its
     // headline numbers, not its methods.
     evaluation: record.evaluation
@@ -101,6 +146,7 @@ function serialize(record: ReturnType<RequestStore['get']> & {}) {
       agent: set.agent,
       summary: set.summary,
       openQuestions: set.openQuestions,
+      denials: set.denials,
       files: set.files.map((file) => ({ repo: file.repo, path: file.path, rationale: file.rationale })),
     })),
   };
