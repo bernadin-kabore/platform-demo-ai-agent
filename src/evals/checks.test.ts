@@ -1,12 +1,47 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { ChangeSet } from '../agents/types.js';
+import type { ChangeSet, ProposedFile, SubAgentName } from '../agents/types.js';
+import { RequestScope, type ServiceContext } from '../scope.js';
 import { runDeterministicChecks } from './checks.js';
 
-function changeSet(files: ChangeSet['files']): ChangeSet[] {
-  return [{ agent: 'security', files, summary: 'test', openQuestions: [] }];
+type TestFile = Omit<ProposedFile, 'baseContents'> & { baseContents?: string | null };
+
+/**
+ * A change set as a well-behaved specialist produces one.
+ *
+ * `baseContents: null` is the default because it is what the agent records
+ * after reading a path and finding nothing there — the normal state for a file
+ * it is about to create. Leaving it undefined means "never read", which the
+ * read-before-write check blocks, and the tests that want that behaviour say so
+ * explicitly with `unreadChangeSet`.
+ */
+function changeSet(files: TestFile[], agent: SubAgentName = 'security'): ChangeSet[] {
+  return [
+    {
+      agent,
+      files: files.map((file) => ({ baseContents: null, ...file })),
+      summary: 'test',
+      openQuestions: [],
+      denials: [],
+    },
+  ];
 }
+
+/** A change set whose files were proposed without ever being read. */
+function unreadChangeSet(files: TestFile[], agent: SubAgentName = 'security'): ChangeSet[] {
+  return [{ agent, files: files as ProposedFile[], summary: 'test', openQuestions: [], denials: [] }];
+}
+
+const CHECKOUT_API: ServiceContext = {
+  entityRef: 'component:default/checkout-api',
+  name: 'checkout-api',
+  repo: 'checkout-api',
+  owner: 'group:default/checkout-team',
+};
+
+const serviceScope = () => RequestScope.forService(CHECKOUT_API, 'checkout-team');
+const platformScope = () => RequestScope.platformOnly('platform-team');
 
 const compliantDeployment = `
 apiVersion: apps/v1
@@ -145,4 +180,151 @@ test('an unreviewably large run is blocked', () => {
   }));
   const results = runDeterministicChecks(changeSet(files));
   assert.ok(results.some((r) => r.check === 'reviewable-size' && !r.passed && r.blocking));
+});
+
+
+// ---------------------------------------------------------------------------
+// Authorization. These are the tests that matter most: they assert the
+// boundary holds at the gate, independently of the tool layer that is supposed
+// to have held it already.
+// ---------------------------------------------------------------------------
+
+test('a proposal in another team’s repository is blocked as an authorization failure', () => {
+  const results = runDeterministicChecks(
+    changeSet(
+      [{ repo: 'payments-api', path: 'chart/values.yaml', contents: 'replicaCount: 3\n', rationale: 'r' }],
+      'application',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  assert.ok(
+    results.some((r) => r.check === 'authorization/repo-scope' && !r.passed && r.blocking),
+    'a file in a repository outside the request scope must block the run',
+  );
+});
+
+test('a proposal in the request’s own application repository is authorized', () => {
+  const results = runDeterministicChecks(
+    changeSet(
+      [
+        {
+          repo: 'checkout-api',
+          path: 'chart/values.yaml',
+          contents: 'replicaCount: 3\n',
+          rationale: 'r',
+          baseContents: 'replicaCount: 2\n',
+        },
+      ],
+      'application',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  assert.equal(
+    results.filter((r) => r.check === 'authorization/repo-scope' && !r.passed).length,
+    0,
+    JSON.stringify(results.filter((r) => !r.passed), null, 2),
+  );
+});
+
+test('a specialist with read-only access to the application repository may not write it', () => {
+  // The security specialist can read checkout-api to diagnose a policy
+  // violation and cannot fix it in place — that fix belongs to application.
+  const results = runDeterministicChecks(
+    changeSet(
+      [{ repo: 'checkout-api', path: 'chart/values.yaml', contents: 'replicaCount: 3\n', rationale: 'r' }],
+      'security',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  assert.ok(results.some((r) => r.check === 'authorization/repo-scope' && !r.passed && r.blocking));
+});
+
+test('a platform-only request authorizes no application repository at all', () => {
+  const results = runDeterministicChecks(
+    changeSet(
+      [{ repo: 'checkout-api', path: 'chart/values.yaml', contents: 'replicaCount: 3\n', rationale: 'r' }],
+      'application',
+    ),
+    { scope: platformScope(), conflicts: [] },
+  );
+  assert.ok(results.some((r) => r.check === 'authorization/repo-scope' && !r.passed && r.blocking));
+});
+
+test('two specialists proposing the same file blocks the run', () => {
+  const results = runDeterministicChecks(
+    changeSet([{ repo: 'platform-demo-gitops', path: 'apps/x/a.yaml', contents: 'a: 1\n', rationale: 'r' }]),
+    {
+      scope: platformScope(),
+      conflicts: ['platform-demo-gitops/apps/x/a.yaml was proposed by more than one specialist'],
+    },
+  );
+  assert.ok(results.some((r) => r.check === 'plan/conflicting-proposals' && !r.passed && r.blocking));
+});
+
+// ---------------------------------------------------------------------------
+// Scoped changes.
+// ---------------------------------------------------------------------------
+
+test('proposing a whole file without reading it first is blocked', () => {
+  const results = runDeterministicChecks(
+    unreadChangeSet([
+      { repo: 'platform-demo-gitops', path: 'apps/x/a.yaml', contents: 'a: 1\n', rationale: 'r' },
+    ]),
+  );
+  assert.ok(results.some((r) => r.check === 'scoped-change/read-before-write' && !r.passed && r.blocking));
+});
+
+test('rewriting almost all of a substantial file is blocked', () => {
+  const base = Array.from({ length: 60 }, (_, i) => `line-${i}: value`).join('\n');
+  const rewritten = Array.from({ length: 60 }, (_, i) => `different-${i}: value`).join('\n');
+  const results = runDeterministicChecks(
+    changeSet([
+      {
+        repo: 'platform-demo-gitops',
+        path: 'apps/x/values.yaml',
+        contents: rewritten,
+        rationale: 'r',
+        baseContents: base,
+      },
+    ]),
+  );
+  assert.ok(results.some((r) => r.check === 'scoped-change/minimal-diff' && !r.passed && r.blocking));
+});
+
+test('changing one line of a substantial file is not flagged', () => {
+  const base = Array.from({ length: 60 }, (_, i) => `line-${i}: value`).join('\n');
+  const edited = base.replace('line-7: value', 'line-7: changed');
+  const results = runDeterministicChecks(
+    changeSet([
+      {
+        repo: 'platform-demo-gitops',
+        path: 'apps/x/values.yaml',
+        contents: edited,
+        rationale: 'r',
+        baseContents: base,
+      },
+    ]),
+  );
+  assert.equal(results.filter((r) => r.check === 'scoped-change/minimal-diff' && !r.passed).length, 0);
+});
+
+test('editing a service’s copy of a shared chart template is flagged but not blocked', () => {
+  const results = runDeterministicChecks(
+    changeSet(
+      [
+        {
+          repo: 'checkout-api',
+          path: 'chart/templates/rollout.yaml',
+          contents: 'kind: Rollout\n',
+          rationale: 'r',
+          baseContents: 'kind: Rollout\nmetadata: {}\n',
+        },
+      ],
+      'application',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  const divergence = results.find((r) => r.check === 'application/chart-divergence');
+  assert.ok(divergence && !divergence.passed, 'the divergence should be reported');
+  assert.equal(divergence.blocking, false, 'but it must not block — some services legitimately need one');
 });

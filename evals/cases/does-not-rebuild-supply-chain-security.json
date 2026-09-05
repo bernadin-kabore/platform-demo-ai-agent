@@ -21,9 +21,11 @@
             "repo": "platform-demo-hello-world-template",
             "path": "templates/go/skeleton/.github/workflows/ci.yml",
             "contents": "name: ci\non: [push]\njobs:\n  sign:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: sigstore/cosign-installer@v3\n      - run: cosign sign --yes \"$IMAGE\"\n",
-            "rationale": "Adds image signing to CI."
+            "rationale": "Adds image signing to CI.",
+            "baseContents": null
           }
-        ]
+        ],
+        "denials": []
       }
     ],
     "expectBlocked": [

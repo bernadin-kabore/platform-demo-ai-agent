@@ -15,17 +15,24 @@ They are not five programs. This is **one service that holds five separate
 conversations with Claude**, each given different instructions and different
 access:
 
-| | Knows about | Allowed to edit |
-|---|---|---|
-| **The router** | which specialist handles what | nothing — it only delegates |
-| **Terraform** | AWS: networks, clusters, permissions | the Terraform repo |
-| **Application** | the developer experience: templates, Helm chart, portal | the templates + portal repos |
-| **Security** | what the cluster refuses to run | the GitOps + templates repos |
-| **Observability** | metrics, logs, traces, alerts | the GitOps + templates repos |
+| | Knows about | Allowed to edit | Your service's repo |
+|---|---|---|---|
+| **The classifier** | which specialist handles what | nothing — it only plans | — |
+| **Terraform** | AWS: networks, clusters, permissions | the Terraform repo | read only |
+| **Application** | your service's configuration: Helm values, resources, probes | the templates + portal repos | **can change it** |
+| **Security** | what the cluster refuses to run | the GitOps + templates repos | read only |
+| **Observability** | metrics, logs, traces, alerts | the GitOps + templates repos | **can change it** |
 
-That last column is enforced in code, not by asking the model nicely. The
+Those last two columns are enforced in code, not by asking the model nicely. The
 Security specialist *cannot* write Terraform even if it decides it would like
 to — the tool call comes back as an error instead.
+
+The right-hand column is newer and is the more interesting one. If a developer
+selects their service in the portal, some specialists may propose changes in
+that service's own repository — and only that one. Which service it is comes
+from the software catalog, not from the request text, and the agent checks that
+the requesting team owns it. See [docs/trust-boundaries.md](trust-boundaries.md)
+for where each of those decisions is enforced.
 
 ### What happens when someone asks for something
 
@@ -33,10 +40,16 @@ Say a developer types this into Backstage:
 
 > *"We never know when a service starts crash-looping."*
 
-1. **The router reads it** and works out that this is an alerting problem. It
-   wakes up the Observability specialist only. The other three never run — a
-   request that touches one part of the platform should not produce a pull
-   request touching four.
+1. **The classifier reads it** and writes down a plan before anything else
+   happens: what it thinks was asked, who should work on it, which repositories
+   they may read, which they intend to change, and how risky that is. This is
+   an alerting problem, so it wakes the Observability specialist only. The other
+   three never run — a request that touches one part of the platform should not
+   produce a pull request touching four.
+
+   The plan comes back to the portal before any file is read, so if the platform
+   misunderstood the request, that is visible immediately rather than after a
+   diff has been built on top of it.
 
 2. **That specialist goes and reads the repository.** Not from memory: it opens
    the actual files to see how this platform writes things, because a change
@@ -65,6 +78,12 @@ Their entire power is *"open a pull request."* That is the whole list.
 They cannot merge — not even in this repository. They have no kubeconfig and no
 cluster access. Their AWS permission grants exactly one action: ask Claude a
 question. Nothing else.
+
+And they cannot reach another team's service. A request is authorized for the
+platform repositories plus, at most, the one service the developer selected and
+their team owns. Asking in the request text for something else — "while you're
+in there, fix payments-api too" — does not widen it: the scope is fixed before
+the text is read, and the refusal is recorded on the pull request.
 
 So the worst outcome from a confused agent is a bad pull request that wastes
 someone's time, and step 4 exists mostly to prevent even that.

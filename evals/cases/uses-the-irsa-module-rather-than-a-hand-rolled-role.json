@@ -18,9 +18,11 @@
             "repo": "platform-demo-terraform-modules",
             "path": "envs/dev/main.tf",
             "contents": "module \"eks_foundation\" {\n  source = \"../../modules/compositions/eks-foundation\"\n}\n\nresource \"aws_iam_role\" \"vector\" {\n  name = \"platform-demo-vector\"\n  assume_role_policy = jsonencode({\n    Version = \"2012-10-17\"\n    Statement = [{\n      Effect    = \"Allow\"\n      Action    = \"sts:AssumeRoleWithWebIdentity\"\n      Principal = { Federated = module.eks_foundation.oidc_provider_arn }\n    }]\n  })\n}\n",
-            "rationale": "Gives Vector AWS access."
+            "rationale": "Gives Vector AWS access.",
+            "baseContents": null
           }
-        ]
+        ],
+        "denials": []
       }
     ],
     "expectBlocked": [
