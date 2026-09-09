@@ -37,11 +37,17 @@ jobs:
       - run: npm run lint
       - run: npm test
 
+  # This repository is TypeScript; the nodejs skeleton the shared workflow was
+  # written for is plain JavaScript with flat src/*.test.js. The two inputs
+  # below are what let one coverage implementation serve both, rather than this
+  # component growing a fifth copy of the threshold logic.
   coverage:
     uses: bernadin-kabore/platform-demo-hello-world-template/.github/workflows/code-coverage.yml@main
     with:
       language: nodejs
       coverage-threshold: 70
+      node-version: "22"
+      nodejs-test-command: 'tsx --test "src/**/*.test.ts"'
 
   # ---------------------------------------------------------------------
   # 2. Automated evals — the gate that makes this repository different
