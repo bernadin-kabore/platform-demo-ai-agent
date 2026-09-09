@@ -76,7 +76,19 @@ jobs:
   sast:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0, because gitleaks needs history this job's other tools
+      # do not. On a push it scans the range <before>^..<after>, and with the
+      # default shallow clone <before> is not in the repository at all: git
+      # answers "fatal: ambiguous argument", gitleaks reports "scanned ~0 bytes"
+      # and exits 1. That reads exactly like a secret was found, and it is the
+      # opposite -- nothing was scanned.
+      #
+      # It passed on the pull request and failed on the merge to main because
+      # the two events hand gitleaks different ranges, so this could not have
+      # been caught before the branch landed.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: github/codeql-action/init@v3
         with:
