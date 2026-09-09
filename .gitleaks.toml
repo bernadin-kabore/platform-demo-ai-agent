@@ -1,0 +1,31 @@
+# gitleaks runs in the `sast` job of .github/workflows/ci.yml and exits
+# non-zero on any finding, which is what makes it a gate rather than a report.
+#
+# It has exactly one finding in this repository, and that finding is the point
+# of the file it lives in. src/evals/checks.test.ts asserts that the agent's
+# own secret-detection check refuses a change set containing an AWS access key,
+# so the test has to contain something shaped like one. The eval fixtures work
+# the same way throughout: a fixture is a recorded example of the mistake its
+# case exists to catch, so "the agent must never commit this" and "this file
+# contains exactly that" are both true at once.
+#
+# The allowlist below is therefore narrow on purpose. It permits one literal
+# string, in one file, and nothing else — not the directory, not the rule, and
+# not AKIA-prefixed keys generally. A real key pasted into that same test file
+# would still fail the build.
+#
+# AKIAIOSFODNN7EXAMPLE is AWS's own documentation placeholder, published in
+# their IAM examples. It has never been a credential.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-access-token"
+description = "AWS Access Key"
+regex = '''(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}'''
+
+  [rules.allowlist]
+  description = "AWS's published example key, used as a negative-test fixture"
+  paths = ['''^src/evals/checks\.test\.ts$''']
+  regexes = ['''AKIAIOSFODNN7EXAMPLE''']
