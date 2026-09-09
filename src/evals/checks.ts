@@ -407,6 +407,21 @@ function authorizedRepos(changeSets: ChangeSet[], context: EvalContext): CheckRe
             `The ${set.agent} specialist proposed a change to ${file.repo}, which this request did not authorize it to write (${context.scope.describe()}). This should have been refused when it was proposed, so treat it as a defect in the agent rather than as a rejected suggestion.`,
           ),
         );
+        continue;
+      }
+      // The repository grant is only half of the authorization. An
+      // application's source repository holds every service the team owns and
+      // its GitOps repository holds every service's deployment state, so a
+      // write to the right repository can still be a write to a sibling
+      // service or to something shared by all of them.
+      if (!context.scope.isWritablePath(file.repo, file.path)) {
+        results.push(
+          fail(
+            'authorization/path-scope',
+            `${file.repo}/${file.path}`,
+            `The ${set.agent} specialist proposed a change to ${file.path}, which is outside what this request authorizes in ${file.repo} (${context.scope.writablePaths(file.repo)}). Either it belongs to a sibling service, or it is shared by every service in the application — both are somebody else's change. This should have been refused when it was proposed.`,
+          ),
+        );
       }
     }
   }
@@ -415,7 +430,7 @@ function authorizedRepos(changeSets: ChangeSet[], context: EvalContext): CheckRe
       check: 'authorization/repo-scope',
       passed: true,
       blocking: false,
-      message: `Every proposed file is inside the authorized scope: ${context.scope.describe()}.`,
+      message: `Every proposed file is inside the authorized scope, by repository and by path: ${context.scope.describe()}.`,
     });
   }
   return results;
@@ -506,33 +521,40 @@ function scopedChange(changeSets: ChangeSet[]): CheckResult[] {
 }
 
 /**
- * Application repositories hold a *copy* of the shared chart, which makes one
- * particular change quietly expensive: editing chart/templates/ in one service
- * forks it from the platform's chart, and nothing detects the divergence until
- * a later platform-wide template change fails to reach that service.
+ * Flags a service-scoped change that reaches into an application's shared
+ * deployment state.
  *
- * Advisory rather than blocking. There are legitimate reasons to add a template
- * to one service — a PrometheusRule for that service being the obvious one — so
- * this is a flag for the reviewer, not a refusal.
+ * An application's GitOps repository holds one Helm chart and one
+ * env-values.yaml per environment, shared by every service in the application.
+ * A change there is not wrong — it is how you raise the replica floor for a
+ * whole environment — but it is not a change to the one service the request
+ * was scoped to, and it lands on the on-call rotation of every other service
+ * in the application.
+ *
+ * This is a second, independent statement of the rule RequestScope enforces at
+ * proposal time. The eval harness replays recorded change sets that never went
+ * through the tool layer, so without it a fixture could carry a shared-state
+ * edit past the gate that exists to catch exactly that.
  */
-function applicationChartHygiene(changeSets: ChangeSet[], context: EvalContext): CheckResult[] {
-  const applicationRepo = context.scope.applicationRepo;
-  if (!applicationRepo) return [];
+function applicationSharedStateHygiene(changeSets: ChangeSet[], context: EvalContext): CheckResult[] {
+  const service = context.scope.service;
+  if (!service) return [];
 
+  const shared = ['chart/', 'argocd/'];
   const results: CheckResult[] = [];
   for (const set of changeSets) {
     for (const file of set.files) {
-      if (file.repo !== applicationRepo) continue;
-      if (!file.path.startsWith('chart/templates/')) continue;
-      const isNewFile = file.baseContents === null;
+      if (file.repo !== service.gitopsRepo) continue;
+      const isSharedChart = shared.some((prefix) => file.path.startsWith(prefix));
+      const isEnvValues = file.path.endsWith('/env-values.yaml');
+      if (!isSharedChart && !isEnvValues) continue;
       results.push(
         fail(
-          'application/chart-divergence',
+          'application/shared-deployment-state',
           `${file.repo}/${file.path}`,
-          isNewFile
-            ? "This adds a template to one service's copy of the shared chart. That is legitimate for something genuinely specific to this service, but if every service should have it, it belongs in common/chart/templates/ in the templates repository instead."
-            : "This edits one service's copy of a shared chart template, forking it from the platform chart. The divergence stays invisible until a later platform-wide change fails to reach this service. A values change is almost always the right lever; if the template genuinely must change, change it in common/chart/.",
-          false,
+          isEnvValues
+            ? `This changes ${file.path}, which every service in ${service.application} renders with. The request is scoped to ${service.entityRef}; its own deployment state is environments/<environment>/services/${service.gitopsService}.yaml. If the change genuinely belongs to the whole environment, say so and let a human make it there.`
+            : `This edits the application's shared Helm chart, which every service in ${service.application} deploys from. A values change in environments/<environment>/services/${service.gitopsService}.yaml is almost always the right lever; if the chart genuinely must change, it affects every service and is not a service-scoped change.`,
         ),
       );
     }
@@ -615,7 +637,7 @@ export function runDeterministicChecks(changeSets: ChangeSet[], context?: EvalCo
     results.push(
       ...authorizedRepos(changeSets, context),
       ...noConflictingProposals(context),
-      ...applicationChartHygiene(changeSets, context),
+      ...applicationSharedStateHygiene(changeSets, context),
       ...platformAbstractions(changeSets, context),
     );
   }

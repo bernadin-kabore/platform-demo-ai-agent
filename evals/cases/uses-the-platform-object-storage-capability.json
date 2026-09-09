@@ -4,17 +4,21 @@
   "intent": "We need somewhere to keep the files users upload during checkout. Where should that live?",
   "requester": "checkout-team",
   "service": {
-    "entityRef": "component:default/checkout-api",
-    "name": "checkout-api",
-    "repo": "checkout-api",
-    "owner": "group:default/checkout-team"
+    "entityRef": "component:default/checkout-platform-auth",
+    "name": "checkout-platform-auth",
+    "application": "checkout-platform",
+    "owner": "group:default/checkout-team",
+    "sourceRepo": "checkout-platform-source",
+    "sourcePath": "services/auth",
+    "gitopsRepo": "checkout-platform-gitops",
+    "gitopsService": "auth"
   },
   "expect": {
     "agents": [
       "application"
     ],
     "mustWriteRepos": [
-      "checkout-api"
+      "checkout-platform-gitops"
     ],
     "mustNotWriteRepos": [
       "platform-demo-terraform-modules"
@@ -26,15 +30,15 @@
     "changeSets": [
       {
         "agent": "terraform",
-        "summary": "Added an S3 bucket for checkout-api's uploads.",
+        "summary": "Added an S3 bucket for checkout-platform-auth's uploads.",
         "openQuestions": [],
         "denials": [],
         "files": [
           {
             "repo": "platform-demo-terraform-modules",
             "path": "envs/dev/checkout_api_uploads.tf",
-            "contents": "resource \"aws_s3_bucket\" \"checkout_api_uploads\" {\n  bucket = \"checkout-api-uploads-dev\"\n  tags   = local.tags\n}\n",
-            "rationale": "checkout-api needs object storage for uploaded files.",
+            "contents": "resource \"aws_s3_bucket\" \"checkout_api_uploads\" {\n  bucket = \"checkout-platform-auth-uploads-dev\"\n  tags   = local.tags\n}\n",
+            "rationale": "checkout-platform-auth needs object storage for uploaded files.",
             "baseContents": null
           }
         ]
