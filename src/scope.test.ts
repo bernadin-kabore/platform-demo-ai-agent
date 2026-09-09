@@ -18,12 +18,24 @@ import {
  * whose job is to say no. The one property worth stating explicitly: there is
  * no test asserting that some input *widens* a scope, because there is no code
  * path that can. If a future change adds one, the reviewer should ask why.
+ *
+ * The application model made this file's job larger in one specific way. A
+ * request used to resolve to one repository that held exactly one service, so
+ * "authorized for checkout-api" and "authorized for this service" were the same
+ * sentence. Now an application's source repository holds every service its team
+ * owns and its GitOps repository holds every service's deployment state, so the
+ * repository grant is no longer the boundary — the path is. Most of what is new
+ * below is that distinction.
  */
 const VALID: ServiceContext = {
-  entityRef: 'component:default/checkout-api',
-  name: 'checkout-api',
-  repo: 'checkout-api',
+  entityRef: 'component:default/checkout-platform-auth',
+  name: 'checkout-platform-auth',
+  application: 'checkout-platform',
   owner: 'group:default/checkout-team',
+  sourceRepo: 'checkout-platform-source',
+  sourcePath: 'services/auth',
+  gitopsRepo: 'checkout-platform-gitops',
+  gitopsService: 'auth',
 };
 
 test('a well-formed serviceContext owned by the requester is accepted', () => {
@@ -48,30 +60,54 @@ test('a team may not act on a service another team owns', () => {
 });
 
 test('a serviceContext naming a platform repository is refused outright', () => {
-  // The smuggling guard. A Component whose project-slug annotation points at a
-  // platform repository would otherwise turn an application request into write
-  // access to the cluster's source of truth — and that annotation lives in a
-  // file the requesting team controls.
+  // The smuggling guard, now doubled because there are two repositories to
+  // smuggle through. A Component whose annotations point at a platform
+  // repository would otherwise turn an application request into write access to
+  // the cluster's source of truth — and those annotations live in a file the
+  // requesting team controls.
+  for (const field of ['sourceRepo', 'gitopsRepo'] as const) {
+    assert.throws(
+      () => validateServiceContext({ ...VALID, [field]: 'platform-demo-gitops' }, 'checkout-team'),
+      (error: unknown) => error instanceof ScopeDenied && /platform repository/.test(error.message),
+      `expected ${field} naming a platform repository to be denied`,
+    );
+  }
+});
+
+test('a serviceContext claiming one repository is both source and GitOps is refused', () => {
+  // The separation between code and deployment state is what the whole
+  // application model exists to create. Collapsing the two would give
+  // source-path write access to deployment state.
   assert.throws(
     () =>
       validateServiceContext(
-        { ...VALID, repo: 'platform-demo-gitops' },
+        { ...VALID, gitopsRepo: 'checkout-platform-source' },
         'checkout-team',
       ),
-    (error: unknown) => error instanceof ScopeDenied && /platform repository/.test(error.message),
+    (error: unknown) => error instanceof ScopeDenied && /separate repositories/.test(error.message),
   );
 });
 
 test('malformed or missing fields deny rather than defaulting', () => {
   const cases: [string, unknown][] = [
-    ['not an object', 'checkout-api'],
+    ['not an object', 'checkout-platform-auth'],
     ['null', null],
-    ['bad entity reference', { ...VALID, entityRef: 'checkout-api' }],
-    ['entity reference for the wrong kind', { ...VALID, entityRef: 'group:default/checkout-api' }],
-    ['repository name with a path separator', { ...VALID, repo: 'org/checkout-api' }],
-    ['repository name with a traversal', { ...VALID, repo: '../platform-demo-gitops' }],
+    ['bad entity reference', { ...VALID, entityRef: 'checkout-platform-auth' }],
+    ['entity reference for the wrong kind', { ...VALID, entityRef: 'group:default/checkout-auth' }],
+    ['source repository with a path separator', { ...VALID, sourceRepo: 'org/checkout-source' }],
+    ['source repository with a traversal', { ...VALID, sourceRepo: '../platform-demo-gitops' }],
+    ['gitops repository with a traversal', { ...VALID, gitopsRepo: '../platform-demo-gitops' }],
     ['empty owner', { ...VALID, owner: '   ' }],
     ['missing name', { ...VALID, name: '' }],
+    ['missing application', { ...VALID, application: '' }],
+    // The path fields are what make a scope narrower than a repository, so
+    // they are held to the same standard as the repository names.
+    ['source path outside services/', { ...VALID, sourcePath: '.github/workflows' }],
+    ['source path at the repository root', { ...VALID, sourcePath: '' }],
+    ['source path with a traversal', { ...VALID, sourcePath: 'services/../.github' }],
+    ['source path reaching a sibling', { ...VALID, sourcePath: 'services/auth/../payments' }],
+    ['gitops service with a separator', { ...VALID, gitopsService: 'environments/dev' }],
+    ['gitops service with a traversal', { ...VALID, gitopsService: '..' }],
   ];
   for (const [description, input] of cases) {
     assert.throws(
@@ -84,15 +120,85 @@ test('malformed or missing fields deny rather than defaulting', () => {
 
 test('a platform-only scope reaches no application repository', () => {
   const scope = RequestScope.platformOnly('platform-team');
-  assert.equal(scope.applicationRepo, undefined);
-  assert.equal(scope.isApplicationRepo('checkout-api'), false);
+  assert.deepEqual(scope.applicationRepos, []);
+  assert.equal(scope.isApplicationRepo('checkout-platform-source'), false);
 });
 
-test('a service scope reaches exactly one application repository', () => {
+test('a service scope reaches exactly the two repositories of its application', () => {
   const scope = RequestScope.forService(VALID, 'checkout-team');
-  assert.equal(scope.applicationRepo, 'checkout-api');
-  assert.equal(scope.isApplicationRepo('checkout-api'), true);
-  assert.equal(scope.isApplicationRepo('payments-api'), false);
+  assert.equal(scope.sourceRepo, 'checkout-platform-source');
+  assert.equal(scope.gitopsRepo, 'checkout-platform-gitops');
+  assert.equal(scope.isApplicationRepo('checkout-platform-source'), true);
+  assert.equal(scope.isApplicationRepo('checkout-platform-gitops'), true);
+  assert.equal(scope.isApplicationRepo('payments-platform-source'), false);
+});
+
+test('a service may be written only inside its own directory in the source repository', () => {
+  const scope = RequestScope.forService(VALID, 'checkout-team');
+  const source = 'checkout-platform-source';
+
+  assert.equal(scope.isWritablePath(source, 'services/auth/src/index.js'), true);
+  assert.equal(scope.isWritablePath(source, 'services/auth/Dockerfile'), true);
+
+  // A sibling service in the same repository. This is the case the path rule
+  // exists for: the repository grant alone would have allowed it.
+  assert.equal(scope.isWritablePath(source, 'services/payments/src/index.js'), false);
+  // A service whose name merely starts with this one's.
+  assert.equal(scope.isWritablePath(source, 'services/auth-proxy/src/index.js'), false);
+  // Shared by every service in the application.
+  assert.equal(scope.isWritablePath(source, 'platform.yaml'), false);
+  assert.equal(scope.isWritablePath(source, '.github/workflows/ci.yml'), false);
+  assert.equal(scope.isWritablePath(source, 'catalog-info.yaml'), false);
+  // The service's own directory, but not a file in it.
+  assert.equal(scope.isWritablePath(source, 'services/auth'), false);
+});
+
+test('a service may be written only in its own deployment-state files', () => {
+  const scope = RequestScope.forService(VALID, 'checkout-team');
+  const gitops = 'checkout-platform-gitops';
+
+  for (const environment of ['dev', 'staging', 'prod']) {
+    assert.equal(
+      scope.isWritablePath(gitops, `environments/${environment}/services/auth.yaml`),
+      true,
+      `${environment} should be writable`,
+    );
+  }
+
+  // Another service's deployment state.
+  assert.equal(scope.isWritablePath(gitops, 'environments/dev/services/payments.yaml'), false);
+  // Shared by every service in the application.
+  assert.equal(scope.isWritablePath(gitops, 'environments/dev/env-values.yaml'), false);
+  assert.equal(scope.isWritablePath(gitops, 'chart/values.yaml'), false);
+  assert.equal(scope.isWritablePath(gitops, 'chart/templates/rollout.yaml'), false);
+  assert.equal(scope.isWritablePath(gitops, 'argocd/applicationset.yaml'), false);
+  // Right name, wrong shape.
+  assert.equal(scope.isWritablePath(gitops, 'environments/dev/services/auth.yml'), false);
+  assert.equal(scope.isWritablePath(gitops, 'environments/dev/services/auth.yaml.bak'), false);
+});
+
+test('path traversal does not escape a service, whatever shape it arrives in', () => {
+  const scope = RequestScope.forService(VALID, 'checkout-team');
+  const source = 'checkout-platform-source';
+  const traversals = [
+    'services/auth/../payments/src/index.js',
+    'services/auth/./../../platform.yaml',
+    '/services/auth/src/index.js',
+    'services\\auth\\src\\index.js',
+    'services//auth/src/index.js',
+    '',
+    '   ',
+  ];
+  for (const path of traversals) {
+    assert.equal(scope.isWritablePath(source, path), false, `expected "${path}" to be refused`);
+  }
+});
+
+test('a platform repository has no path restriction', () => {
+  // A specialist writing a platform repository is acting as the platform, not
+  // as one service, so there is nothing to narrow it to.
+  const scope = RequestScope.forService(VALID, 'checkout-team');
+  assert.equal(scope.isWritablePath('platform-demo-gitops', 'apps/kyverno/policies/anything.yaml'), true);
 });
 
 test('every specialist may read all four platform repositories', () => {
@@ -122,34 +228,61 @@ test('a specialist may write only the platform repositories in its own domain', 
 test('expertise and repository ownership are separate: read on an app repo is not write', () => {
   const scope = RequestScope.forService(VALID, 'checkout-team');
 
-  // Application owns a service's configuration and may change it.
-  assert.equal(grantsFor(SUB_AGENTS.application, scope).get('checkout-api')?.write, true);
-  assert.equal(grantsFor(SUB_AGENTS.observability, scope).get('checkout-api')?.write, true);
+  // Application and Observability own a service's configuration and its code,
+  // and may change both. Where those changes may land is a path question,
+  // tested above; this is only about which repositories are writable at all.
+  for (const agent of ['application', 'observability'] as const) {
+    const grants = grantsFor(SUB_AGENTS[agent], scope);
+    assert.equal(grants.get('checkout-platform-source')?.write, true, `${agent} should write source`);
+    assert.equal(grants.get('checkout-platform-gitops')?.write, true, `${agent} should write gitops`);
+  }
 
-  // Security and Terraform can diagnose inside the service's repository and
-  // cannot fix things there — that change belongs to the Application domain.
-  const security = grantsFor(SUB_AGENTS.security, scope).get('checkout-api');
-  assert.equal(security?.read, true);
-  assert.equal(security?.write, false);
-
-  const terraform = grantsFor(SUB_AGENTS.terraform, scope).get('checkout-api');
-  assert.equal(terraform?.read, true);
-  assert.equal(terraform?.write, false);
+  // Security and Terraform can diagnose inside both repositories and cannot fix
+  // anything in either — that change belongs to the Application domain.
+  for (const agent of ['security', 'terraform'] as const) {
+    const grants = grantsFor(SUB_AGENTS[agent], scope);
+    for (const repo of ['checkout-platform-source', 'checkout-platform-gitops']) {
+      assert.equal(grants.get(repo)?.read, true, `${agent} should read ${repo}`);
+      assert.equal(grants.get(repo)?.write, false, `${agent} must not write ${repo}`);
+    }
+  }
 });
 
-test('a specialist with no application access does not see the repository at all', () => {
+test('a specialist with no application access does not see either repository', () => {
   const scope = RequestScope.forService(VALID, 'checkout-team');
   const grants = grantsFor(
-    { platformRepos: ['platform-demo-gitops'], applicationRepoAccess: 'none' },
+    { platformRepos: ['platform-demo-gitops'], sourceAccess: 'none', gitopsAccess: 'none' },
     scope,
   );
-  assert.equal(grants.has('checkout-api'), false);
+  assert.equal(grants.has('checkout-platform-source'), false);
+  assert.equal(grants.has('checkout-platform-gitops'), false);
+});
+
+test('the two application repositories are granted independently', () => {
+  // A specialist that may change how a service is deployed is not thereby one
+  // that may change what it does. Nothing in grantsFor couples them.
+  const scope = RequestScope.forService(VALID, 'checkout-team');
+  const grants = grantsFor(
+    { platformRepos: [], sourceAccess: 'read', gitopsAccess: 'write' },
+    scope,
+  );
+  assert.equal(grants.get('checkout-platform-source')?.write, false);
+  assert.equal(grants.get('checkout-platform-gitops')?.write, true);
 });
 
 test('no other team’s repository is ever granted, whatever the scope', () => {
   const scope = RequestScope.forService(VALID, 'checkout-team');
   for (const definition of Object.values(SUB_AGENTS)) {
     const grants = grantsFor(definition, scope);
-    assert.equal(grants.has('payments-api'), false, `${definition.name} must not reach payments-api`);
+    assert.equal(
+      grants.has('payments-platform-source'),
+      false,
+      `${definition.name} must not reach payments-platform-source`,
+    );
+    assert.equal(
+      grants.has('payments-platform-gitops'),
+      false,
+      `${definition.name} must not reach payments-platform-gitops`,
+    );
   }
 });

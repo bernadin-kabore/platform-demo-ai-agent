@@ -33,14 +33,22 @@ function unreadChangeSet(files: TestFile[], agent: SubAgentName = 'security'): C
   return [{ agent, files: files as ProposedFile[], summary: 'test', openQuestions: [], denials: [] }];
 }
 
-const CHECKOUT_API: ServiceContext = {
-  entityRef: 'component:default/checkout-api',
-  name: 'checkout-api',
-  repo: 'checkout-api',
+const CHECKOUT_AUTH: ServiceContext = {
+  entityRef: 'component:default/checkout-platform-auth',
+  name: 'checkout-platform-auth',
+  application: 'checkout-platform',
   owner: 'group:default/checkout-team',
+  sourceRepo: 'checkout-platform-source',
+  sourcePath: 'services/auth',
+  gitopsRepo: 'checkout-platform-gitops',
+  gitopsService: 'auth',
 };
 
-const serviceScope = () => RequestScope.forService(CHECKOUT_API, 'checkout-team');
+/** Where this service's deployment state lives, and the only file in the
+ *  GitOps repository a request scoped to it may write. */
+const AUTH_VALUES = 'environments/dev/services/auth.yaml';
+
+const serviceScope = () => RequestScope.forService(CHECKOUT_AUTH, 'checkout-team');
 const platformScope = () => RequestScope.platformOnly('platform-team');
 
 const compliantDeployment = `
@@ -203,13 +211,13 @@ test('a proposal in another team’s repository is blocked as an authorization f
   );
 });
 
-test('a proposal in the request’s own application repository is authorized', () => {
+test('a proposal in the request’s own deployment state is authorized', () => {
   const results = runDeterministicChecks(
     changeSet(
       [
         {
-          repo: 'checkout-api',
-          path: 'chart/values.yaml',
+          repo: 'checkout-platform-gitops',
+          path: AUTH_VALUES,
           contents: 'replicaCount: 3\n',
           rationale: 'r',
           baseContents: 'replicaCount: 2\n',
@@ -227,11 +235,13 @@ test('a proposal in the request’s own application repository is authorized', (
 });
 
 test('a specialist with read-only access to the application repository may not write it', () => {
-  // The security specialist can read checkout-api to diagnose a policy
-  // violation and cannot fix it in place — that fix belongs to application.
+  // The security specialist can read a service's deployment state to diagnose
+  // a policy violation and cannot fix it in place — that fix belongs to the
+  // application domain. Without this the test would pass for the wrong
+  // reason: an unknown repository is refused too, but by a different rule.
   const results = runDeterministicChecks(
     changeSet(
-      [{ repo: 'checkout-api', path: 'chart/values.yaml', contents: 'replicaCount: 3\n', rationale: 'r' }],
+      [{ repo: 'checkout-platform-gitops', path: AUTH_VALUES, contents: 'replicaCount: 3\n', rationale: 'r' }],
       'security',
     ),
     { scope: serviceScope(), conflicts: [] },
@@ -242,7 +252,7 @@ test('a specialist with read-only access to the application repository may not w
 test('a platform-only request authorizes no application repository at all', () => {
   const results = runDeterministicChecks(
     changeSet(
-      [{ repo: 'checkout-api', path: 'chart/values.yaml', contents: 'replicaCount: 3\n', rationale: 'r' }],
+      [{ repo: 'checkout-platform-gitops', path: AUTH_VALUES, contents: 'replicaCount: 3\n', rationale: 'r' }],
       'application',
     ),
     { scope: platformScope(), conflicts: [] },
@@ -308,23 +318,75 @@ test('changing one line of a substantial file is not flagged', () => {
   assert.equal(results.filter((r) => r.check === 'scoped-change/minimal-diff' && !r.passed).length, 0);
 });
 
-test('editing a service’s copy of a shared chart template is flagged but not blocked', () => {
+test('a proposal in a sibling service’s directory is blocked as an authorization failure', () => {
+  // The case the path rule exists for. Both services live in one repository, so
+  // the repository grant alone would have allowed this — and the team that owns
+  // payments is not the team that asked.
   const results = runDeterministicChecks(
     changeSet(
       [
         {
-          repo: 'checkout-api',
-          path: 'chart/templates/rollout.yaml',
-          contents: 'kind: Rollout\n',
+          repo: 'checkout-platform-source',
+          path: 'services/payments/src/index.js',
+          contents: 'const x = 1;\n',
           rationale: 'r',
-          baseContents: 'kind: Rollout\nmetadata: {}\n',
+          baseContents: 'const x = 0;\n',
         },
       ],
       'application',
     ),
     { scope: serviceScope(), conflicts: [] },
   );
-  const divergence = results.find((r) => r.check === 'application/chart-divergence');
-  assert.ok(divergence && !divergence.passed, 'the divergence should be reported');
-  assert.equal(divergence.blocking, false, 'but it must not block — some services legitimately need one');
+  assert.ok(results.some((r) => r.check === 'authorization/path-scope' && !r.passed && r.blocking));
+});
+
+test('a proposal in the application’s shared deployment state is blocked', () => {
+  // env-values.yaml is rendered by every service in the application. Narrow as
+  // the edit looks, it is not a change to the one service in scope.
+  const results = runDeterministicChecks(
+    changeSet(
+      [
+        {
+          repo: 'checkout-platform-gitops',
+          path: 'environments/dev/env-values.yaml',
+          contents: 'replicaCount: 4\n',
+          rationale: 'r',
+          baseContents: 'replicaCount: 2\n',
+        },
+      ],
+      'application',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  assert.ok(results.some((r) => r.check === 'authorization/path-scope' && !r.passed && r.blocking));
+  assert.ok(
+    results.some((r) => r.check === 'application/shared-deployment-state' && !r.passed),
+    'and it is reported as shared state, not only as a path violation',
+  );
+});
+
+test('a service may still ship its own alerting rules', () => {
+  // The capability that consolidating the chart could have removed. A rule that
+  // concerns one service is values in that service's own deployment state, and
+  // nothing about it is shared — so it passes cleanly.
+  const results = runDeterministicChecks(
+    changeSet(
+      [
+        {
+          repo: 'checkout-platform-gitops',
+          path: AUTH_VALUES,
+          contents: 'replicaCount: 2\nprometheusRules:\n  - alert: OOMKilled\n    expr: up == 0\n',
+          rationale: 'r',
+          baseContents: 'replicaCount: 2\n',
+        },
+      ],
+      'observability',
+    ),
+    { scope: serviceScope(), conflicts: [] },
+  );
+  assert.equal(
+    results.filter((r) => !r.passed && r.blocking).length,
+    0,
+    'a service-scoped alert rule must not be blocked',
+  );
 });

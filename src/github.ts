@@ -8,8 +8,8 @@ import type { EvalReport } from './evals/harness.js';
 import { type ExecutionPlan, planToMarkdown } from './plan/types.js';
 
 // The agent authenticates as a GitHub App installation, not a personal access
-// token, for the same reason the scaffolded services' update-manifests job
-// does (see platform-demo-hello-world-template's ci.yml): the credential is a
+// token, for the same reason an application's gitops-pr job does (see
+// platform-demo-hello-world-template's application skeleton): the credential is a
 // short-lived installation token scoped to the repositories the App is
 // installed on, and it is attributable in the audit log to the App rather than
 // to a human.

@@ -5,7 +5,7 @@ import type { AuditTrail } from '../audit.js';
 import type { ProposedFile, SubAgentName } from '../agents/types.js';
 import * as github from '../github.js';
 import type { RepoGrant, RequestScope } from '../scope.js';
-import { readDenial, writeDenial } from '../scope.js';
+import { readDenial, writeDenial, writePathDenial } from '../scope.js';
 import { capabilityBriefing } from './capabilities.js';
 
 /**
@@ -67,6 +67,24 @@ function assertWritable(context: ToolContext, repo: string): void {
   context.denials.push(message);
   context.audit.record(context.agent, 'denied repository write', { repo, reason: message });
   throw new Denied(message);
+}
+
+/**
+ * The second half of a write authorization, and the one that is new with the
+ * application model.
+ *
+ * A repository grant is no longer sufficient on its own: an application's
+ * source repository holds every service its team owns and its GitOps
+ * repository holds every service's deployment state, so "may write
+ * checkout-platform-gitops" would authorize changing a sibling service that a
+ * different team is on call for. RequestScope decides; this function is only
+ * the call site that fails closed on its answer.
+ */
+function assertWritablePath(context: ToolContext, repo: string, path: string): void {
+  if (context.scope.isWritablePath(repo, path)) return;
+  const message = writePathDenial(repo, path, context.agent, context.scope);
+  context.audit.record(context.agent, 'denied out-of-scope path write', { repo, path, reason: message });
+  throw new Error(message);
 }
 
 export function buildTools(context: ToolContext) {
@@ -164,6 +182,7 @@ export function buildTools(context: ToolContext) {
     }),
     run: async ({ repo, path, contents, rationale }) => {
       assertWritable(context, repo);
+      assertWritablePath(context, repo, path);
       const key = `${repo}/${path}`;
       const existingIndex = context.proposals.findIndex((p) => p.repo === repo && p.path === path);
       const proposal: ProposedFile = {

@@ -273,12 +273,14 @@ The image is built, scanned, signed and SBOM-attested by
 [`ci.yml`](.github/workflows/ci.yml), which then opens a pull request against
 `platform-demo-gitops` bumping the digest in `apps/ai-platform-agent/`.
 
-Note the asymmetry with scaffolded services: those push their image-tag bump
-straight to their own `main`, because `platform-deploy-bot` has a ruleset bypass
-there. This component deploys out of the GitOps repository, whose `main` is
-protected by Terraform with no bypass actor at all. So a new version of the
-agent reaches the cluster only when a human merges it — which seems like the
-right rule for the one component that can open pull requests everywhere else.
+This used to be an asymmetry worth pointing out: scaffolded services pushed
+their image-tag bump straight to their own `main` under a `platform-deploy-bot`
+ruleset bypass, while this component had to ask. It is not an asymmetry any
+more. Applications now deploy from a GitOps repository of their own, and their
+pipelines open a pull request against it exactly as this one does. Nothing on
+the platform holds a ruleset bypass, so no image reaches the cluster without a
+human merging something — which was always the right rule for the one component
+that can open pull requests everywhere else, and is now the rule everywhere.
 
 ## Known risks
 
