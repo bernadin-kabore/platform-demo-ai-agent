@@ -31,17 +31,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm }
+        with: { node-version: "22", cache: npm }
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
 
+  # This repository is TypeScript; the nodejs skeleton the shared workflow was
+  # written for is plain JavaScript with flat src/*.test.js. The two inputs
+  # below are what let one coverage implementation serve both, rather than this
+  # component growing a fifth copy of the threshold logic.
   coverage:
     uses: bernadin-kabore/platform-demo-hello-world-template/.github/workflows/code-coverage.yml@main
     with:
       language: nodejs
       coverage-threshold: 70
+      node-version: "22"
+      nodejs-test-command: 'tsx --test "src/**/*.test.ts"'
 
   # ---------------------------------------------------------------------
   # 2. Automated evals — the gate that makes this repository different
@@ -59,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm }
+        with: { node-version: "22", cache: npm }
       - run: npm ci
       - name: Offline eval suite
         run: npm run evals
@@ -94,12 +100,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm }
+        with: { node-version: "22", cache: npm }
       - run: npm ci
       - run: npm audit --audit-level=high
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -146,7 +152,7 @@ jobs:
           tags: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           severity: HIGH,CRITICAL
